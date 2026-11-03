@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sales - DealerAI</title><link rel="stylesheet" href="css/style.css">
+</head>
+<body><div class="app"><aside class="sidebar"><a class="nav-link" href="dashboard.html">Dashboard</a>
+<a class="nav-link" href="inventory.html">Inventory</a>
+<a class="nav-link" href="customers.html">Customers</a>
+<a class="nav-link" href="leads.html">Leads</a>
+<a class="nav-link" href="appointments.html">Appointment</a>
+<a class="nav-link" href="sales.html">Sales</a>
+<a class="nav-link" href="report.html">Report</a>
+<a class="nav-link" href="settings.html">Setting</a></aside><main class="main"><header class="topbar"><h1>Sales</h1></header><section class="content"><div class="page-actions"><span></span><button class="blue-btn">+ New Sales</button></div>
+<div class="stats">
+<div class="stat"><h3>Total sales(All time)</h3><div><strong>84</strong></div></div>
+<div class="stat"><h3>Revenue this month</h3><div><strong>$486,200</strong></div></div>
+<div class="stat"><h3>Close deals</h3><div><strong>42</strong></div></div>
+<div class="stat"><h3>Pending deals</h3><div><strong>12</strong></div></div>
+</div>
+<div class="filter-card"><div class="filter-grid">
+<div class="filter-field"><label>Status</label><select><option>All Statuses</option><option>Completed</option><option>Pending</option><option>In Progress</option><option>Contract Signed</option><option>Awaiting Payment</option><option>Awaiting Delivery</option><option>Cancelled</option><option>Refunded</option></select></div>
+<div class="filter-field"><label>Sales Rep</label><select><option>All Sales Reps</option></select></div>
+<div class="filter-field"><label>Vehicle Type</label><select><option>All Vehicle Types</option></select></div>
+<div class="filter-field"><label>Date Range</label><select><option>This Month</option><option>Past Week</option><option>Past Month</option><option>Past 3 Months</option></select></div>
+<div class="filter-field"><label>&nbsp;</label><input placeholder="⌕  Search sales..." /></div>
+<button class="filter-btn">▽ Filters</button>
+</div></div>
+<div class="table-card"><table class="data-table">
+<thead><tr><th>Customer</th><th>Vehicle</th><th>Sales Rep</th><th>Sale Date</th><th>Price</th><th>Payment</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+<tr><td><div class="customer-cell"><span class="avatar av-img"></span><div><b>Emily Johnson</b><span class="sub">emily.j@email.com<br>(408) 555-9213</span></div></div></td><td><span class="photo"></span> Tesla Model 3<span class="sub">2023 · Sedan</span></td><td>Michael Chen</td><td>Jun 20, 2026<span class="sub">10:00 AM</span></td><td><b>$39,990</b></td><td><span class="badge green">Cash</span></td><td><span class="badge green">Completed</span></td><td><button class="icon-btn">⊙</button><button class="icon-btn">✎</button><span class="menu-wrap"><button class="icon-btn" data-menu-button>⋮</button><span class="more-menu"><button>View Invoice</button><button>View Sales Contract</button><button>Email Receipt</button><button>Schedule Vehicle Delivery</button><button>Manage Financing</button><button>Manage Trade-In</button><button class="danger">Cancel Sale</button><button class="danger">Delete Record</button></span></span></td></tr>
+<tr><td><div class="customer-cell"><span class="avatar av-img"></span><div><b>David Lee</b><span class="sub">david.lee@email.com<br>(650) 555-7821</span></div></div></td><td><span class="photo"></span> Toyota Camry<span class="sub">2022 · Sedan</span></td><td>Sarah Martinez</td><td>Jun 20, 2026<span class="sub">1:30 PM</span></td><td><b>$28,500</b></td><td><span class="badge blue">Finance</span></td><td><span class="badge orange">Pending</span></td><td><button class="icon-btn">⊙</button><button class="icon-btn">✎</button><span class="menu-wrap"><button class="icon-btn" data-menu-button>⋮</button><span class="more-menu"><button>View Invoice</button><button>View Sales Contract</button><button>Email Receipt</button><button>Schedule Vehicle Delivery</button><button>Manage Financing</button><button>Manage Trade-In</button><button class="danger">Cancel Sale</button><button class="danger">Delete Record</button></span></span></td></tr>
+<tr><td><div class="customer-cell"><span class="avatar av-img"></span><div><b>Michael Brown</b><span class="sub">michael.b@email.com<br>(831) 555-4488</span></div></div></td><td><span class="photo"></span> Honda CR-V<span class="sub">2021 · SUV</span></td><td>James Anderson</td><td>Jun 21, 2026<span class="sub">11:00 AM</span></td><td><b>$32,750</b></td><td><span class="badge purple">Lease</span></td><td><span class="badge blue">In Progress</span></td><td><button class="icon-btn">⊙</button><button class="icon-btn">✎</button><span class="menu-wrap"><button class="icon-btn" data-menu-button>⋮</button><span class="more-menu"><button>View Invoice</button><button>View Sales Contract</button><button>Email Receipt</button><button>Schedule Vehicle Delivery</button><button>Manage Financing</button><button>Manage Trade-In</button><button class="danger">Cancel Sale</button><button class="danger">Delete Record</button></span></span></td></tr>
+</tbody></table></div></section></main></div><script src="js/app.js"></script></body>
+</html>
