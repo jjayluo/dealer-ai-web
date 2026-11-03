@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Conversation - DealerAI</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app conversation-app">
+  <aside class="sidebar">
+    <a class="nav-link" href="dashboard.html">Dashboard</a>
+    <a class="nav-link" href="inventory.html">Inventory</a>
+    <a class="nav-link" href="customers.html">Customers</a>
+    <a class="nav-link active" href="leads.html">Leads</a>
+    <a class="nav-link" href="appointments.html">Appointment</a>
+    <a class="nav-link" href="sales.html">Sales</a>
+    <a class="nav-link" href="report.html">Report</a>
+    <a class="nav-link" href="settings.html">Setting</a>
+  </aside>
+
+  <main class="conversation-main">
+    <section class="conversation-list-panel">
+      <div class="conversation-list-head">
+        <div class="conversation-list-title-row">
+          <h1>Conversations</h1>
+          <span class="hamburger">≡</span>
+        </div>
+        <input class="conversation-search" placeholder="Search conversations">
+        <div class="conversation-tabs">
+          <button class="conversation-tab active">All <span>3</span></button>
+          <button class="conversation-tab">Unread <span>1</span></button>
+          <button class="conversation-tab">Filter</button>
+        </div>
+      </div>
+
+      <button class="conversation-person active" data-contact="alex">
+        <span class="avatar av-blue">AC</span>
+        <span class="conversation-person-copy">
+          <strong>Alex Chen</strong>
+          <small>Interested in Toyota Camry</small>
+        </span>
+        <span class="conversation-person-meta"><small>10:07 AM</small><b>1</b></span>
+      </button>
+      <button class="conversation-person" data-contact="maria">
+        <span class="avatar av-pink">ML</span>
+        <span class="conversation-person-copy"><strong>Maria Lopez</strong><small>Honda Civic 2021</small></span>
+        <span class="conversation-person-meta"><small>Yesterday</small></span>
+      </button>
+      <button class="conversation-person" data-contact="david">
+        <span class="avatar av-green">DK</span>
+        <span class="conversation-person-copy"><strong>David Kim</strong><small>Tesla Model 3 2023</small></span>
+      </button>
+    </section>
+
+    <section class="conversation-chat-panel">
+      <header class="conversation-chat-header">
+        <div>
+          <h2>Chat with <span id="chatCustomerName">Alex Chen</span> <span class="chat-online">● Online</span></h2>
+        </div>
+        <div class="chat-header-actions">
+          <button class="outline-danger" id="endChatBtn">End Chat</button>
+          <button class="soft-button" id="closeChatBtn">Closed</button>
+        </div>
+      </header>
+
+      <div class="translation-bar">
+        <div class="translation-title">◎ Auto-translation enabled</div>
+        <label>Customer language
+          <select id="customerLanguage">
+            <option value="zh">中文（简体）</option>
+            <option value="es">Español</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <label>Reply language
+          <select id="replyLanguage">
+            <option value="en">English</option>
+            <option value="zh">中文（简体）</option>
+            <option value="es">Español</option>
+          </select>
+        </label>
+        <div class="ai-toggle-box">
+          <span>AI auto-reply</span>
+          <button class="toggle-switch on" id="aiToggle" aria-label="Toggle AI reply"><span></span></button>
+          <button class="show-original-btn" id="showOriginalBtn">Show original</button>
+        </div>
+      </div>
+
+      <div class="conversation-messages" id="conversationMessages">
+        <div class="conversation-date">Today</div>
+
+        <div class="message-group incoming">
+          <div class="message-row">
+            <span class="mini-avatar av-blue">AC</span>
+            <div class="message-bubble incoming">Is this car still available?<br>I would like to come see it today.</div>
+          </div>
+          <div class="translated-text" data-original="这辆车现在还有吗？我想今天过去看看。">这辆车现在还有吗？我想今天过去看看。</div>
+          <button class="original-link">Original (Chinese)⌄</button>
+        </div>
+
+        <div class="message-group outgoing">
+          <div class="message-bubble outgoing">Yes, the Toyota Camry 2022 is still available.<br>You're welcome to come see it today!<br>What time would work best for you?<span class="message-time">10:06 AM ✓✓</span></div>
+          <button class="original-link">Original (Chinese)⌄</button>
+        </div>
+
+        <div class="message-group incoming">
+          <div class="message-row">
+            <span class="mini-avatar av-blue">AC</span>
+            <div class="message-bubble incoming">Around 3 PM would be great.</div>
+          </div>
+          <div class="translated-text" data-original="下午 3 点左右可以。">下午 3 点左右可以。</div>
+          <button class="original-link">Original (Chinese)⌃</button>
+        </div>
+
+        <div class="message-group outgoing">
+          <div class="message-bubble outgoing">Perfect — I’ll reserve 3:00 PM for you.<br>See you this afternoon!<span class="message-time">10:08 AM ✓✓</span></div>
+          <button class="original-link">Original (Chinese)⌄</button>
+        </div>
+
+        <button class="ai-suggestion" id="aiSuggestionBtn">✦ AI suggestion: Send appointment confirmation and test-drive details.</button>
+      </div>
+
+      <div class="conversation-composer">
+        <textarea id="messageInput" placeholder="Type your message..."></textarea>
+        <div class="composer-status">Will send in <strong id="sendLanguageLabel">Chinese</strong> &nbsp;•&nbsp; Auto-translation on</div>
+        <div class="composer-bottom">
+          <button class="attach-button">＋ Attach</button>
+          <div class="composer-actions">
+            <a class="secondary-btn" href="add-appointment.html">Appointment</a>
+            <button class="blue-btn" id="sendMessageBtn">Send</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <aside class="customer-details-panel">
+      <h2>Customer Details</h2>
+      <div class="customer-profile-row">
+        <span class="large-avatar av-blue">AC</span>
+        <div><h3>Alex Chen</h3><small>(213) 555-0187</small><small>alex.chen@email.com</small></div>
+      </div>
+
+      <div class="customer-info-block">
+        <label>Language</label>
+        <div class="info-value-row"><strong id="customerLanguageText">中文（简体）</strong><button>Change</button></div>
+      </div>
+      <div class="customer-info-block"><label>Lead Source</label><strong>Facebook Marketplace</strong></div>
+
+      <div class="customer-info-block">
+        <h3>Interested Vehicle</h3>
+        <div class="vehicle-summary">
+          <div class="vehicle-placeholder">Toyota<br>Camry</div>
+          <div><strong>2022 Toyota Camry</strong><b>$27,900</b><small>18,450 miles</small></div>
+        </div>
+      </div>
+
+      <div class="customer-info-block">
+        <h3>Conversation Summary</h3>
+        <ul class="summary-list"><li>Asked about availability</li><li>Wants to visit today</li><li>Confirmed 3:00 PM</li><li>Translation enabled</li></ul>
+        <a href="leads.html" class="details-link">View Full Lead Profile</a>
+      </div>
+
+      <div class="customer-info-block">
+        <h3>Assigned To</h3>
+        <div class="assigned-row"><span class="large-avatar assigned-avatar">SJ</span><div><strong>Sarah Johnson</strong><small>Sales Specialist</small><span class="assigned-online">● Online</span></div></div>
+      </div>
+    </aside>
+  </main>
+</div>
+<script src="js/app.js"></script>
+</body>
+</html>
