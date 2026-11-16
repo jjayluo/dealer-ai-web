@@ -1,6 +1,7 @@
 import {createServer} from 'node:http';
 import {createHash,timingSafeEqual} from 'node:crypto';
 import {db} from './db.js';
+import { generateDraftReply } from '../ai-service/draft-reply.js';
 const key=process.env.STAFF_API_TOKEN;
 if (!key || key.length<32) throw new Error('Set STAFF_API_TOKEN (at least 32 characters)');
 const digest=s=>createHash('sha256').update(s).digest();
