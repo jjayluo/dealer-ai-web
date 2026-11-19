@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DealerAI — Dealership Workspace</title>
+  <link rel="stylesheet" href="/css/style.css">
+  <link rel="stylesheet" href="/app/app.css">
+  <script src="/app/app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login-card">
+    <h1>DealerAI</h1><p>Sign in to manage inventory, customers, leads and staff access.</p>
+    <form id="login-form">
+      <label>Email<input name="email" type="email" autocomplete="username" required></label>
+      <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="blue-btn" type="submit">Sign in</button>
+    </form>
+    <p class="muted">Use your staff account. Ask an administrator if you need access.</p>
+  </section>
+  <section id="accept" class="login-card" hidden>
+    <h1>Accept invitation</h1><p>Set your name and a password of at least 10 characters to activate your account.</p>
+    <form id="accept-form">
+      <label>Invitation token<input name="token" type="text" autocomplete="off" required></label>
+      <label>Full name<input name="name" type="text" autocomplete="name" required></label>
+      <label>Password<input name="password" type="password" autocomplete="new-password" minlength="10" required></label>
+      <button class="blue-btn" type="submit">Activate account</button>
+    </form>
+  </section>
+  <div id="workspace" class="app" hidden>
+    <aside class="sidebar">
+      <p class="brand">DealerAI</p>
+      <nav aria-label="Main navigation">
+        <a class="nav-link" href="#vehicles">Inventory</a>
+        <a class="nav-link" href="#customers">Customers</a>
+        <a class="nav-link" href="#leads">Leads</a>
+        <a class="nav-link" id="users-nav" href="#users">Users</a>
+      </nav>
+      <p id="user-label"></p><button id="logout" class="secondary-btn">Sign out</button>
+    </aside>
+    <main class="main">
+      <header class="topbar"><h1 id="page-title">Inventory</h1></header>
+      <section class="content">
+        <div id="stats" class="stats" aria-label="Module totals"></div>
+        <div class="page-actions"><p id="description" class="muted"></p><button id="add" class="blue-btn">Add vehicle</button></div>
+        <form id="filters" class="filter-card"></form>
+        <div id="results" class="table-card" aria-live="polite"></div>
+        <div class="pagination"><button id="previous" class="secondary-btn">Previous</button><span id="page-info"></span><button id="next" class="secondary-btn">Next</button></div>
+      </section>
+    </main>
+  </div>
+  <p id="notice" role="status" aria-live="polite" hidden></p>
+  <dialog id="editor" aria-labelledby="dialog-title"><div id="dialog-content"></div></dialog>
+</body>
+</html>
