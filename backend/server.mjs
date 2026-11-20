@@ -204,7 +204,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   } else {
     const { server } = createApp({ store, secret: process.env.DEALER_JWT_SECRET });
     const port = Number(process.env.PORT || 3000);
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(port, '0.0.0.0', () => {
       console.log(`DealerAI: http://localhost:${port}/app/`);
       console.log(`Database: ${databasePath}`);
       if (initialized) console.log(`Owner account created: ${email}`);
