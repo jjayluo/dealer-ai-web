@@ -21,7 +21,9 @@ node backend/server.mjs
 - 首次启动只创建 Owner 账号，不生成车辆、客户或线索数据。
 - `DEALER_ADMIN_*` 仅在数据库首次初始化时使用，之后启动可省略。
 
-启动前可设置 `PORT`、`DEALER_DB_PATH`、`DEALER_ADMIN_EMAIL`、`DEALER_ADMIN_PASSWORD`、`DEALER_JWT_SECRET`。账号及密码仅在数据库首次初始化时生效；JWT 密钥不设置时每次启动重新生成，旧登录将失效。数据文件路径会打印在启动日志。
+启动前可设置 `PORT`、`DEALER_DB_PATH`、`DEALER_ADMIN_EMAIL`、`DEALER_ADMIN_PASSWORD`、`DEALER_JWT_SECRET`、`APP_ORIGIN`。账号及密码仅在数据库首次初始化时生效；JWT 密钥不设置时每次启动重新生成，旧登录将失效。数据文件路径会打印在启动日志。
+
+服务默认监听 `0.0.0.0`，并通过 `APP_ORIGIN`（默认 `http://localhost:3000`）校验请求的 Host 和 Origin。如果通过其他主机名或端口访问，必须把 `APP_ORIGIN` 设为实际访问的 origin，否则会返回 403。Host/Origin 校验不是身份认证；不要把服务直接暴露到不可信网络，生产环境需要防火墙、HTTPS 和反向代理。
 
 AI 草稿可选配置 `OPENAI_API_KEY` 和 `AI_MODEL`；两者都存在时调用 OpenAI Responses API，否则使用本地确定性草稿。设置 `AI_PROVIDER=local` 可强制使用本地草稿。API key 只在服务端使用，不会返回浏览器。
 
@@ -126,7 +128,7 @@ node --test backend/test/api.test.mjs
 
 ## 本地版本边界
 
-这是可运行的本地核心功能版本，服务仅监听 `127.0.0.1`，不是文档中完整的生产部署。技术上使用 Node 原生 HTTP + SQLite（JSON 字段存储、唯一索引及事务）；尚未采用文档规划的 NestJS、PostgreSQL、Next.js、S3。当前列表在门店数据范围内执行内存筛选，适用于本地小规模验证。
+这是可运行的本地核心功能版本，服务默认监听 `0.0.0.0` 并由 `APP_ORIGIN` 限制 Host/Origin，不是文档中完整的生产部署。技术上使用 Node 原生 HTTP + SQLite（JSON 字段存储、唯一索引及事务）；尚未采用文档规划的 NestJS、PostgreSQL、Next.js、S3。当前列表在门店数据范围内执行内存筛选，适用于本地小规模验证。
 
 AI 已接入**助审草稿**；未接入翻译、自动回复、短信/邮件/WhatsApp 真实投递、外部平台抓取、预约、交易结算，也未提供 refresh token、密码重置或完整的生产身份系统（如 MFA、邀请邮件发送）。经销商资料、时区、货币与 AI 策略设置（`/settings`）不在本次三个模块范围内。用户邀请在本版本中返回一次性令牌，需要管理员自行安全地转交。销售权限和门店隔离在接口层生效，但生产身份系统与账号生命周期管理仍需后续集成。备注/媒体的访问均需登录。照片目前仅验证 MIME、文件头和大小，不含生产要求的病毒扫描、解码重编码、EXIF 清理或主图排序。
 

@@ -19,6 +19,7 @@ async function fixture(t) {
   const network = process.env.DEALER_HTTP_TEST === '1';
   if (network) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); }
   const base = `http://127.0.0.1:${network ? server.address().port : 3000}`;
+  process.env.APP_ORIGIN = base;
   // Exercise the same request handler without sockets in restricted environments.
   // DEALER_HTTP_TEST=1 runs these assertions over real HTTP instead.
   const fetchLocal = network ? fetch : async (url, options = {}) => {

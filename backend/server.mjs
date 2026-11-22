@@ -77,31 +77,10 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
       res.end(status === 204 ? undefined : JSON.stringify({ data, meta: { request_id, ...meta } }));
     };
     try {
-    //  if (!/^(localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/.test(req.headers.host || '')) throw new ApiError(403, 'INVALID_HOST', 'This local service only accepts loopback hosts');
-    //  if (req.headers.origin && req.headers.origin !== `http://${req.headers.host}`) throw new ApiError(403, 'INVALID_ORIGIN', 'Cross-origin access is disabled');
-    const appOrigin = process.env.APP_ORIGIN
-    || 'http://localhost:3000';
-
-    const allowedUrl = new URL(appOrigin);
-
-    if (req.headers.host !== allowedUrl.host) {
-      throw new ApiError(
-      403,
-      'INVALID_HOST',
-      'Host is not allowed'
-      );
-     }
-
-if (
-  req.headers.origin &&
-  req.headers.origin !== allowedUrl.origin
-) {
-  throw new ApiError(
-    403,
-    'INVALID_ORIGIN',
-    'Cross-origin access is disabled'
-  );
-}
+      const appOrigin = process.env.APP_ORIGIN || 'http://localhost:3000';
+      const allowedUrl = new URL(appOrigin);
+      if (req.headers.host !== allowedUrl.host) throw new ApiError(403, 'INVALID_HOST', 'Host is not allowed');
+      if (req.headers.origin && req.headers.origin !== allowedUrl.origin) throw new ApiError(403, 'INVALID_ORIGIN', 'Cross-origin access is disabled');
       const url = new URL(req.url, 'http://localhost');
       const path = url.pathname;
       if (!path.startsWith('/api/')) {
