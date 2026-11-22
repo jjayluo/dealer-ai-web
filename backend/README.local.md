@@ -59,6 +59,7 @@ Linux/WSL 下默认数据库为 `backend/data/dealer.sqlite`。**推荐在 WSL �
 - 会话关联客户，建议关联车辆；车辆是 AI 回复的事实来源。员工可以在库存车辆详情点 **Start conversation**，或在 Conversations 页面新建会话并记录客户的具体问题。
 - `POST /api/v1/conversations/{id}/ai-suggestion` 将**当前车辆公开事实 + 最新客户问题**交给模型，返回客户可读草稿和仅员工可见的核查提示。草稿不会自动发送，员工必须审阅、编辑后再发送。
 - 车辆公开事实仅包含年份、品牌、车型、配置、里程、标价、可售状态、车身/颜色/变速箱/驱动/燃料/车况、位置和描述。**采购成本、最低价、内部备注不会进入 AI 输入，也不会进入草稿。**
+- 如果车辆描述中包含导入的 CARFAX 报告摘要，AI 可以引用为 “the CARFAX report summary on file says …”，但不得声称独立验证或 accident-free；没有摘要时仍回答历史未验证。
 - 配置 `OPENAI_API_KEY` 和 `AI_MODEL` 时调用 OpenAI；未配置或提供方失败时使用本地确定性草稿，并在 UI 中明确标注。AI 不可承诺库存、保修、金融审批或议价结果；缺失事实会写入核查提示。
 - 客户标记 `do not contact` 时，AI 草稿和出站消息都会被拒绝。出站消息要求 `Idempotency-Key`：相同 key + 相同内容返回原消息，不同内容返回 409。
 - 消息目前记录在 CRM 本地，`delivery_status` 为 `recorded`（出站）或 `received`（入站），不投递到短信/邮件；`channel` 只是上下文标签。

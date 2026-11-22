@@ -3,6 +3,8 @@ const usd = value => Number.isFinite(Number(value))
   : null;
 
 export function buildVehicleFacts(vehicle = {}) {
+  const description = typeof vehicle.description === 'string' ? vehicle.description.slice(0, 1500) : null;
+  const historySummary = description && /CARFAX/i.test(description) ? description : null;
   return {
     stock_number: vehicle.stock_number ?? null,
     vin: vehicle.vin ?? null,
@@ -22,8 +24,8 @@ export function buildVehicleFacts(vehicle = {}) {
     drivetrain: vehicle.drivetrain ?? null,
     fuel_type: vehicle.fuel_type ?? null,
     location: vehicle.location ?? null,
-    description: typeof vehicle.description === 'string' ? vehicle.description.slice(0, 1500) : null,
-    history_summary: null,
+    description,
+    history_summary: historySummary,
     inspection_notes: null,
   };
 }
@@ -70,8 +72,14 @@ export function fallbackReply({ vehicleFacts = {}, question = '', language = 'en
   }
 
   if (/\b(accident|history|carfax|damage|clean title|title|inspection)\b/.test(text)) {
-    sentences.push('We do not have verified accident or history information in the CRM; our team can check it before you visit.');
-    notes.push('Vehicle history is not verified; do not claim an accident-free history.');
+    if (facts.history_summary) {
+      sentences.push(`The report summary on file says: ${facts.history_summary}`);
+      sentences.push('Our team can review the full report with you; this summary is not a substitute for an independent inspection.');
+      notes.push('History summary is from the CARFAX report on file; do not claim it is independently verified or accident-free.');
+    } else {
+      sentences.push('We do not have verified accident or history information in the CRM; our team can check it before you visit.');
+      notes.push('Vehicle history is not verified; do not claim an accident-free history.');
+    }
     answeredDetail = true;
   }
 
@@ -143,8 +151,10 @@ If the vehicle is sold, say so and offer to help find a similar vehicle.
 If availability is pending, reserved, in transit or draft, say staff must confirm it.
 If availability is available, say it is listed as available but staff must confirm
 it before a visit.
-If the buyer asks about accident or vehicle history and no verified history is
-provided, say it has not been verified.
+If a historySummary is provided, you may summarize it as "the CARFAX report
+summary on file says ..." and note that staff can review the full report.
+Do not claim it is independently verified and never claim accident-free.
+If historySummary is absent, say history has not been verified.
 If the buyer asks about warranty or financing, say staff will review it; do not
 confirm coverage, approval, APR, term or a monthly payment.
 If the buyer proposes a test-drive time, acknowledge it and say staff will confirm;

@@ -557,4 +557,13 @@ test('conversation validation and AI privacy boundary', async t => {
   const soldVehicle = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2022, make: 'Honda', model: 'Accord', status: 'sold' }), question: 'Is it available?' });
   assert.match(soldVehicle.draft.toLowerCase(), /sold/);
   assert.equal(soldVehicle.provider, 'local');
+
+  const historyFacts = buildVehicleFacts({ year: 2013, make: 'Toyota', model: 'Prius Two', status: 'available', description: 'CARFAX report dated Sep 16, 2026: 3 owners, 2 reported minor damage events; title brands show no problems.' });
+  assert.match(historyFacts.history_summary, /2 reported minor damage events/);
+  const historyReply = fallbackReply({ vehicleFacts: historyFacts, question: 'Does it have any accident history?' });
+  assert.match(historyReply.draft, /report summary on file/i);
+  assert.match(historyReply.draft, /minor damage/i);
+  assert.equal(historyReply.draft.includes('do not have verified accident'), false);
+  const noHistoryReply = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2013, make: 'Toyota', model: 'Prius Two', status: 'available' }), question: 'Does it have any accident history?' });
+  assert.match(noHistoryReply.draft, /do not have verified accident/i);
 });
