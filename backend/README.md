@@ -4,7 +4,7 @@ This branch contains two independent backend implementations. They use different
 
 | Implementation | Entry point | Data store | Purpose |
 | --- | --- | --- | --- |
-| Local full-stack app | `server.mjs` | SQLite | Product UI at `/app/`: inventory, customers, leads and users; JWT auth, role scopes, invitations, audit history and API tests. See [README.local.md](README.local.md). |
+| Local full-stack app | `server.mjs` | SQLite | Product UI at `/app/`: inventory, customers, leads, users and vehicle-linked conversations with staff-reviewed AI drafts; JWT auth, role scopes, invitations, audit history and API tests. See [README.local.md](README.local.md). |
 | PostgreSQL starter | `server.js` | PostgreSQL | Earlier inventory/customers/leads integration starter with a shared staff bearer token. Kept unchanged. See [README.postgres.md](README.postgres.md). |
 
 Quick start for the local full-stack app, from the repository root:

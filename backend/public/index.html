@@ -34,18 +34,67 @@
         <a class="nav-link" href="#vehicles">Inventory</a>
         <a class="nav-link" href="#customers">Customers</a>
         <a class="nav-link" href="#leads">Leads</a>
+        <a class="nav-link" href="#conversations">Conversations</a>
         <a class="nav-link" id="users-nav" href="#users">Users</a>
       </nav>
       <p id="user-label"></p><button id="logout" class="secondary-btn">Sign out</button>
     </aside>
     <main class="main">
       <header class="topbar"><h1 id="page-title">Inventory</h1></header>
-      <section class="content">
+      <section id="standard-view" class="content">
         <div id="stats" class="stats" aria-label="Module totals"></div>
         <div class="page-actions"><p id="description" class="muted"></p><button id="add" class="blue-btn">Add vehicle</button></div>
         <form id="filters" class="filter-card"></form>
         <div id="results" class="table-card" aria-live="polite"></div>
         <div class="pagination"><button id="previous" class="secondary-btn">Previous</button><span id="page-info"></span><button id="next" class="secondary-btn">Next</button></div>
+      </section>
+      <section id="conversation-view" class="conversation-main" hidden>
+        <section class="conversation-list-panel">
+          <div class="conversation-list-head">
+            <div class="conversation-list-title-row">
+              <h1>Inbox</h1>
+              <button class="blue-btn compact" id="new-conversation" type="button">+ New</button>
+            </div>
+            <input class="conversation-search" id="conversation-search" placeholder="Search conversations">
+            <div class="conversation-tabs" id="conversation-tabs">
+              <button class="conversation-tab active" type="button" data-filter="all">All <span id="conv-count-all">0</span></button>
+              <button class="conversation-tab" type="button" data-filter="open">Open <span id="conv-count-open">0</span></button>
+              <button class="conversation-tab" type="button" data-filter="unread">Unread <span id="conv-count-unread">0</span></button>
+              <button class="conversation-tab" type="button" data-filter="closed">Closed <span id="conv-count-closed">0</span></button>
+            </div>
+          </div>
+          <div id="conversation-list" class="conversation-list">
+            <p class="empty">Loading…</p>
+          </div>
+          <div id="conversation-pagination" class="conversation-pagination"></div>
+        </section>
+        <section class="conversation-chat-panel">
+          <header class="conversation-chat-header">
+            <div>
+              <h2 id="conversation-title">Conversations</h2>
+              <span id="conversation-subtitle" class="muted"></span>
+            </div>
+            <div class="chat-header-actions" id="conversation-actions"></div>
+          </header>
+          <div class="conversation-messages" id="conversation-messages">
+            <p class="empty">Select a conversation to view messages.</p>
+          </div>
+          <div id="ai-suggestion-panel" class="suggest ai-panel" hidden></div>
+          <div class="conversation-composer" id="conversation-composer" hidden>
+            <textarea id="message-input" placeholder="Type your reply..."></textarea>
+            <div class="composer-status" id="composer-status"></div>
+            <div class="composer-bottom">
+              <button class="attach-button" type="button" id="log-customer-message">+ Log customer question</button>
+              <div class="composer-actions">
+                <button class="secondary-btn" type="button" id="ai-reply-btn">✦ AI suggested reply</button>
+                <button class="blue-btn" type="button" id="send-reply-btn">Send reply</button>
+              </div>
+            </div>
+          </div>
+        </section>
+        <aside class="customer-details-panel" id="conversation-context">
+          <p class="empty">Customer and vehicle context appears here.</p>
+        </aside>
       </section>
     </main>
   </div>

@@ -6,6 +6,8 @@ import { passwordHash } from './passwords.mjs';
 
 export const ROLES = ['owner', 'manager', 'sales', 'bdc'];
 export const USER_STATUSES = ['invited', 'active', 'disabled'];
+export const CONVERSATION_CHANNELS = ['web', 'email', 'phone', 'sms', 'facebook', 'whatsapp'];
+export const CONVERSATION_STATUSES = ['open', 'closed'];
 const roleRank = { owner: 3, manager: 2, sales: 1, bdc: 1 };
 const managerRoles = ['owner', 'manager'];
 
@@ -139,6 +141,64 @@ export class Store {
       CREATE UNIQUE INDEX IF NOT EXISTS lead_external ON leads(organization_id, json_extract(data, '$.source'), json_extract(data, '$.external_lead_id')) WHERE json_extract(data, '$.external_lead_id') IS NOT NULL AND json_extract(data, '$.external_lead_id') != '';
       CREATE INDEX IF NOT EXISTS customers_assigned ON customers(organization_id, json_extract(data, '$.assigned_user_id'));
       CREATE INDEX IF NOT EXISTS leads_assigned ON leads(organization_id, json_extract(data, '$.assigned_user_id'));
+    `);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS conversations (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        vehicle_id TEXT,
+        lead_id TEXT,
+        channel TEXT NOT NULL DEFAULT 'web',
+        status TEXT NOT NULL DEFAULT 'open',
+        assigned_user_id TEXT,
+        customer_language TEXT NOT NULL DEFAULT 'en',
+        reply_language TEXT NOT NULL DEFAULT 'en',
+        ai_auto_reply_enabled INTEGER NOT NULL DEFAULT 0,
+        last_message_at TEXT,
+        last_message_preview TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS conversations_tenant ON conversations(organization_id, status, last_message_at);
+      CREATE INDEX IF NOT EXISTS conversations_assigned ON conversations(organization_id, assigned_user_id);
+      CREATE TABLE IF NOT EXISTS messages (
+        id TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        sender_type TEXT NOT NULL,
+        sender_user_id TEXT,
+        direction TEXT NOT NULL,
+        body TEXT NOT NULL,
+        original_body TEXT,
+        original_language TEXT,
+        translated_language TEXT,
+        translation_provider TEXT,
+        ai_generated INTEGER NOT NULL DEFAULT 0,
+        ai_confidence REAL,
+        channel TEXT NOT NULL DEFAULT 'web',
+        delivery_status TEXT NOT NULL DEFAULT 'recorded',
+        external_message_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS messages_conversation ON messages(organization_id, conversation_id, created_at);
+      CREATE TABLE IF NOT EXISTS conversation_reads (
+        conversation_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        last_read_at TEXT NOT NULL,
+        PRIMARY KEY (conversation_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS message_operations (
+        organization_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        conversation_id TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (organization_id, user_id, idempotency_key)
+      );
     `);
   }
   close() { this.db.close(); }
@@ -460,6 +520,238 @@ export class Store {
       }
       this.db.prepare('UPDATE invitations SET revoked_at = ? WHERE id = ?').run(now, id);
       this.audit('users', invitation.user_id, actor, 'invitation_revoked', { email: invitation.email });
+    });
+  }
+  activeUser(id, organizationId) {
+    return this.db.prepare('SELECT id, name, role FROM users WHERE id = ? AND organization_id = ? AND active = 1').get(id, organizationId);
+  }
+  conversationScope(actor) {
+    if (managerRoles.includes(actor.role)) return { sql: '', params: [] };
+    if (actor.role === 'sales') return { sql: 'AND assigned_user_id = ?', params: [actor.id] };
+    if (actor.role === 'bdc') return { sql: "AND (assigned_user_id = ? OR assigned_user_id IS NULL OR assigned_user_id = '')", params: [actor.id] };
+    return { sql: 'AND 0', params: [] };
+  }
+  conversationRow(id, actor) {
+    const scope = this.conversationScope(actor);
+    const row = this.db.prepare(`SELECT * FROM conversations WHERE id = ? AND organization_id = ? ${scope.sql}`).get(id, actor.organization_id, ...scope.params);
+    if (!row) throw new ApiError(404, 'NOT_FOUND', 'Conversation not found');
+    return row;
+  }
+  related(kind, id, actor) {
+    if (!id) return null;
+    try { return this.project(kind, this.get(kind, id, actor, true, true), actor); } catch { return null; }
+  }
+  unreadCount(conversationId, actor) {
+    const read = this.db.prepare('SELECT last_read_at FROM conversation_reads WHERE conversation_id = ? AND user_id = ?').get(conversationId, actor.id);
+    const row = this.db.prepare(`SELECT COUNT(*) AS total FROM messages WHERE organization_id = ? AND conversation_id = ? AND direction = 'inbound' AND created_at > ?`).get(actor.organization_id, conversationId, read?.last_read_at || '');
+    return row.total;
+  }
+  markConversationRead(conversationId, actor) {
+    this.db.prepare(`INSERT INTO conversation_reads (conversation_id, user_id, last_read_at) VALUES (?, ?, ?)
+      ON CONFLICT(conversation_id, user_id) DO UPDATE SET last_read_at = excluded.last_read_at`).run(conversationId, actor.id, new Date().toISOString());
+  }
+  conversationView(row, actor) {
+    return {
+      ...row,
+      ai_auto_reply_enabled: Boolean(row.ai_auto_reply_enabled),
+      customer: this.related('customers', row.customer_id, actor),
+      vehicle: this.related('vehicles', row.vehicle_id, actor),
+      lead: this.related('leads', row.lead_id, actor),
+      assigned_user: row.assigned_user_id ? this.db.prepare('SELECT id, name, role FROM users WHERE id = ? AND organization_id = ?').get(row.assigned_user_id, actor.organization_id) : null,
+      unread_count: this.unreadCount(row.id, actor),
+    };
+  }
+  conversationMessages(conversationId, actor) {
+    this.conversationRow(conversationId, actor);
+    return this.db.prepare(`SELECT m.*, u.name AS sender_name FROM messages m LEFT JOIN users u ON u.id = m.sender_user_id
+      WHERE m.organization_id = ? AND m.conversation_id = ? ORDER BY m.created_at, m.id`).all(actor.organization_id, conversationId).map(message => ({ ...message, ai_generated: Boolean(message.ai_generated) }));
+  }
+  getConversation(id, actor) {
+    const row = this.conversationRow(id, actor);
+    const conversation = this.conversationView(row, actor);
+    conversation.messages = this.conversationMessages(id, actor);
+    this.markConversationRead(id, actor);
+    conversation.unread_count = 0;
+    return conversation;
+  }
+  listConversations(actor, params = new URLSearchParams()) {
+    const page = integerParam(params, 'page', 1, 1000000);
+    const page_size = integerParam(params, 'page_size', 20, 100);
+    const status = params.get('status');
+    if (status && !CONVERSATION_STATUSES.includes(status)) throw new ApiError(422, 'VALIDATION_ERROR', 'Invalid status', { status: `Allowed: ${CONVERSATION_STATUSES.join(', ')}` });
+    const channel = params.get('channel');
+    if (channel && !CONVERSATION_CHANNELS.includes(channel)) throw new ApiError(422, 'VALIDATION_ERROR', 'Invalid channel', { channel: `Allowed: ${CONVERSATION_CHANNELS.join(', ')}` });
+    const unreadOnly = ['1', 'true'].includes(String(params.get('unread_only') || '').toLowerCase());
+    const assigned = params.get('assigned_user_id');
+    const q = params.get('q')?.trim().toLowerCase();
+    const scope = this.conversationScope(actor);
+    const all = this.db.prepare(`SELECT * FROM conversations WHERE organization_id = ? ${scope.sql}
+      ORDER BY COALESCE(last_message_at, created_at) DESC, id DESC`).all(actor.organization_id, ...scope.params).map(row => this.conversationView(row, actor));
+    const counts = {
+      total: all.length,
+      open: all.filter(row => row.status === 'open').length,
+      closed: all.filter(row => row.status === 'closed').length,
+      unread: all.filter(row => row.unread_count > 0).length,
+    };
+    let rows = all;
+    if (status) rows = rows.filter(row => row.status === status);
+    if (channel) rows = rows.filter(row => row.channel === channel);
+    if (assigned) rows = rows.filter(row => row.assigned_user_id === assigned);
+    if (unreadOnly) rows = rows.filter(row => row.unread_count > 0);
+    if (q) rows = rows.filter(row => {
+      const customer = row.customer;
+      const vehicle = row.vehicle;
+      return [customer?.first_name, customer?.last_name, `${customer?.first_name || ''} ${customer?.last_name || ''}`, customer?.email, customer?.phone,
+        vehicle?.year, vehicle?.make, vehicle?.model, vehicle?.stock_number, vehicle?.vin, row.last_message_preview]
+        .some(value => String(value ?? '').toLowerCase().includes(q));
+    });
+    const total = rows.length;
+    return {
+      data: rows.slice((page - 1) * page_size, page * page_size),
+      pagination: { page, page_size, total, total_pages: Math.ceil(total / page_size) },
+      counts,
+    };
+  }
+  createConversation(input, actor) {
+    if (!input || Array.isArray(input) || typeof input !== 'object') fail('body', 'Expected a JSON object');
+    for (const key of Object.keys(input)) if (!['customer_id', 'vehicle_id', 'lead_id', 'message', 'channel', 'assigned_user_id', 'customer_language', 'reply_language'].includes(key)) fail(key, 'Unknown field');
+    if (typeof input.customer_id !== 'string' || !input.customer_id) fail('customer_id', 'Choose a customer');
+    let customer;
+    try { customer = this.get('customers', input.customer_id, actor); } catch { fail('customer_id', 'Choose a customer in your access scope'); }
+    let vehicle = null;
+    if (input.vehicle_id !== undefined && input.vehicle_id !== null && input.vehicle_id !== '') {
+      try { vehicle = this.get('vehicles', input.vehicle_id, actor); } catch { fail('vehicle_id', 'Choose an available vehicle'); }
+    }
+    let lead = null;
+    if (input.lead_id !== undefined && input.lead_id !== null && input.lead_id !== '') {
+      try { lead = this.get('leads', input.lead_id, actor); } catch { fail('lead_id', 'Choose a lead in your access scope'); }
+      if (lead.customer_id !== customer.id) fail('lead_id', 'The lead belongs to a different customer');
+      if (vehicle && lead.vehicle_id && lead.vehicle_id !== vehicle.id) fail('vehicle_id', 'The vehicle does not match the lead');
+    }
+    if (!lead) {
+      lead = this.all('leads', actor).find(item => item.customer_id === customer.id && (!vehicle || item.vehicle_id === vehicle.id) && !['won', 'lost'].includes(item.status)) || null;
+    }
+    const channel = input.channel ?? 'web';
+    if (!CONVERSATION_CHANNELS.includes(channel)) fail('channel', `Allowed: ${CONVERSATION_CHANNELS.join(', ')}`);
+    const customerLanguage = typeof input.customer_language === 'string' && input.customer_language.trim() ? input.customer_language.trim() : 'en';
+    const replyLanguage = typeof input.reply_language === 'string' && input.reply_language.trim() ? input.reply_language.trim() : 'en';
+    if (customerLanguage.length > 10) fail('customer_language', 'Use a language code of at most 10 characters');
+    if (replyLanguage.length > 10) fail('reply_language', 'Use a language code of at most 10 characters');
+    let assigned = actor.id;
+    if (Object.hasOwn(input, 'assigned_user_id') && input.assigned_user_id !== undefined) {
+      if (!managerRoles.includes(actor.role) && input.assigned_user_id !== actor.id) throw new ApiError(403, 'FORBIDDEN', 'You can only assign conversations to yourself');
+      assigned = input.assigned_user_id === '' ? null : input.assigned_user_id;
+      if (assigned && !this.activeUser(assigned, actor.organization_id)) fail('assigned_user_id', 'Choose an active user in this dealership');
+    }
+    if (!managerRoles.includes(actor.role)) assigned = actor.id;
+    let message = null;
+    if (input.message !== undefined) {
+      if (typeof input.message !== 'string' || !input.message.trim() || input.message.length > 5000) fail('message', 'Enter a question of 1–5000 characters');
+      message = input.message.trim();
+    }
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    return this.transaction(() => {
+      this.db.prepare(`INSERT INTO conversations (id, organization_id, customer_id, vehicle_id, lead_id, channel, status, assigned_user_id, customer_language, reply_language, ai_auto_reply_enabled, last_message_at, last_message_preview, version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 0, ?, ?, 1, ?, ?)`)
+        .run(id, actor.organization_id, customer.id, vehicle?.id ?? null, lead?.id ?? null, channel, assigned, customerLanguage, replyLanguage, message ? now : null, message ? message.slice(0, 200) : null, now, now);
+      if (message) {
+        this.db.prepare(`INSERT INTO messages (id, organization_id, conversation_id, sender_type, sender_user_id, direction, body, original_body, original_language, translated_language, translation_provider, ai_generated, ai_confidence, channel, delivery_status, external_message_id, created_at)
+          VALUES (?, ?, ?, 'customer', NULL, 'inbound', ?, ?, ?, NULL, NULL, 0, NULL, ?, 'received', NULL, ?)`)
+          .run(randomUUID(), actor.organization_id, id, message, message, customerLanguage, channel, now);
+      }
+      this.markConversationRead(id, actor);
+      this.audit('conversations', id, actor, 'conversation_created', { customer_id: customer.id, vehicle_id: vehicle?.id ?? null, lead_id: lead?.id ?? null, channel });
+      return this.getConversation(id, actor);
+    });
+  }
+  addMessage(conversationId, input, actor, idempotencyKey) {
+    if (!input || Array.isArray(input) || typeof input !== 'object') fail('body', 'Expected a JSON object');
+    for (const key of Object.keys(input)) if (!['body', 'direction', 'language', 'channel', 'ai_generated'].includes(key)) fail(key, 'Unknown field');
+    const conversation = this.conversationRow(conversationId, actor);
+    if (conversation.status !== 'open') throw new ApiError(409, 'CONVERSATION_CLOSED', 'Reopen the conversation before adding messages');
+    const direction = input.direction ?? 'outbound';
+    if (!['inbound', 'outbound'].includes(direction)) fail('direction', 'Allowed: inbound, outbound');
+    if (typeof input.body !== 'string' || !input.body.trim() || input.body.length > 5000) fail('body', 'Enter a message of 1–5000 characters');
+    const body = input.body.trim();
+    const language = typeof input.language === 'string' && input.language.trim() ? input.language.trim() : (direction === 'inbound' ? conversation.customer_language : conversation.reply_language);
+    if (language.length > 10) fail('language', 'Use a language code of at most 10 characters');
+    const channel = input.channel ?? conversation.channel;
+    if (!CONVERSATION_CHANNELS.includes(channel)) fail('channel', `Allowed: ${CONVERSATION_CHANNELS.join(', ')}`);
+    const aiGenerated = input.ai_generated === true;
+    if (direction === 'inbound' && aiGenerated) fail('ai_generated', 'Inbound messages cannot be AI generated');
+    const key = typeof idempotencyKey === 'string' && idempotencyKey.trim() ? idempotencyKey.trim() : null;
+    if (direction === 'outbound') {
+      const customer = this.get('customers', conversation.customer_id, actor, true, true);
+      if (customer.do_not_contact) throw new ApiError(409, 'CONTACT_SUPPRESSED', 'This customer is marked do not contact');
+      if (!key || key.length > 200) throw new ApiError(428, 'IDEMPOTENCY_KEY_REQUIRED', 'Send an Idempotency-Key header for outbound messages');
+    }
+    const requestHash = createHash('sha256').update(JSON.stringify({ conversationId, direction, body, language, aiGenerated })).digest('hex');
+    const now = new Date().toISOString();
+    return this.transaction(() => {
+      if (key) {
+        const operation = this.db.prepare('SELECT * FROM message_operations WHERE organization_id = ? AND user_id = ? AND idempotency_key = ?').get(actor.organization_id, actor.id, key);
+        if (operation) {
+          if (operation.request_hash !== requestHash) throw new ApiError(409, 'IDEMPOTENCY_CONFLICT', 'This operation key was already used with a different request');
+          const existing = this.db.prepare('SELECT * FROM messages WHERE id = ? AND organization_id = ?').get(operation.message_id, actor.organization_id);
+          const current = this.db.prepare('SELECT version FROM conversations WHERE id = ? AND organization_id = ?').get(conversationId, actor.organization_id);
+          return { message: { ...existing, ai_generated: Boolean(existing?.ai_generated) }, conversation_version: current.version, replayed: true };
+        }
+      }
+      const id = randomUUID();
+      const senderType = direction === 'inbound' ? 'customer' : 'user';
+      const senderUserId = direction === 'inbound' ? null : actor.id;
+      const deliveryStatus = direction === 'inbound' ? 'received' : 'recorded';
+      this.db.prepare(`INSERT INTO messages (id, organization_id, conversation_id, sender_type, sender_user_id, direction, body, original_body, original_language, translated_language, translation_provider, ai_generated, ai_confidence, channel, delivery_status, external_message_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, NULL, ?)`)
+        .run(id, actor.organization_id, conversationId, senderType, senderUserId, direction, body, body, language, aiGenerated ? 1 : 0, channel, deliveryStatus, now);
+      const version = conversation.version + 1;
+      this.db.prepare('UPDATE conversations SET last_message_at = ?, last_message_preview = ?, version = version + 1, updated_at = ? WHERE id = ? AND organization_id = ?')
+        .run(now, body.slice(0, 200), now, conversationId, actor.organization_id);
+      if (key) this.db.prepare('INSERT INTO message_operations (organization_id, user_id, idempotency_key, conversation_id, request_hash, message_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(actor.organization_id, actor.id, key, conversationId, requestHash, id, now);
+      if (direction === 'inbound') this.markConversationRead(conversationId, actor);
+      this.audit('conversations', conversationId, actor, direction === 'inbound' ? 'message_logged' : 'message_sent', { message_id: id, direction, channel, ai_generated: aiGenerated });
+      return {
+        message: { id, organization_id: actor.organization_id, conversation_id: conversationId, sender_type: senderType, sender_user_id: senderUserId, direction, body, original_body: body, original_language: language, translated_language: null, translation_provider: null, ai_generated: aiGenerated, ai_confidence: null, channel, delivery_status: deliveryStatus, external_message_id: null, created_at: now },
+        conversation_version: version,
+        replayed: false,
+      };
+    });
+  }
+  aiContext(id, actor) {
+    const conversation = this.conversationRow(id, actor);
+    const customer = this.get('customers', conversation.customer_id, actor, true, true);
+    if (customer.do_not_contact) throw new ApiError(409, 'CONTACT_SUPPRESSED', 'This customer is marked do not contact');
+    if (!conversation.vehicle_id) throw new ApiError(422, 'VEHICLE_REQUIRED', 'Link a vehicle before requesting an AI reply');
+    let vehicle;
+    try { vehicle = this.get('vehicles', conversation.vehicle_id, actor, true, true); } catch { throw new ApiError(422, 'VEHICLE_REQUIRED', 'The linked vehicle is unavailable'); }
+    const question = this.db.prepare(`SELECT * FROM messages WHERE organization_id = ? AND conversation_id = ? AND direction = 'inbound' ORDER BY created_at DESC, id DESC LIMIT 1`).get(actor.organization_id, id);
+    if (!question) throw new ApiError(422, 'NO_CUSTOMER_MESSAGE', 'Add the customer question before requesting an AI reply');
+    return { conversation, customer, vehicle, question: { ...question, ai_generated: Boolean(question.ai_generated) } };
+  }
+  updateConversation(id, input, actor, expectedVersion) {
+    if (!input || Array.isArray(input) || typeof input !== 'object') fail('body', 'Expected a JSON object');
+    for (const key of Object.keys(input)) if (!['status', 'assigned_user_id'].includes(key)) fail(key, 'Unknown or read-only field');
+    return this.transaction(() => {
+      const conversation = this.conversationRow(id, actor);
+      if (conversation.version !== expectedVersion) throw new ApiError(409, 'STALE_VERSION', 'This conversation changed. Reload it before saving.');
+      const next = { status: conversation.status, assigned_user_id: conversation.assigned_user_id };
+      if (Object.hasOwn(input, 'status')) {
+        if (!CONVERSATION_STATUSES.includes(input.status)) fail('status', `Allowed: ${CONVERSATION_STATUSES.join(', ')}`);
+        next.status = input.status;
+      }
+      if (Object.hasOwn(input, 'assigned_user_id') && input.assigned_user_id !== undefined) {
+        if (!managerRoles.includes(actor.role) && input.assigned_user_id !== actor.id) throw new ApiError(403, 'FORBIDDEN', 'You can only assign conversations to yourself');
+        next.assigned_user_id = input.assigned_user_id === '' ? null : input.assigned_user_id;
+        if (next.assigned_user_id && !this.activeUser(next.assigned_user_id, actor.organization_id)) fail('assigned_user_id', 'Choose an active user in this dealership');
+      }
+      const now = new Date().toISOString();
+      this.db.prepare('UPDATE conversations SET status = ?, assigned_user_id = ?, version = version + 1, updated_at = ? WHERE id = ? AND organization_id = ?')
+        .run(next.status, next.assigned_user_id, now, id, actor.organization_id);
+      const changes = Object.fromEntries(Object.entries(next).filter(([key, value]) => conversation[key] !== value).map(([key, value]) => [key, { before: conversation[key], after: value }]));
+      this.audit('conversations', id, actor, 'conversation_updated', changes);
+      return this.getConversation(id, actor);
     });
   }
 }

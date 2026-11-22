@@ -8,6 +8,7 @@ import { Store, ApiError, schemas } from './domain.mjs';
 import { Auth } from './auth.mjs';
 import { seed } from './seed.mjs';
 import { listRecords } from './query.mjs';
+import { buildVehicleFacts, generateReply } from './ai.mjs';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const root = resolve(directory, '..');
@@ -62,8 +63,9 @@ function inventoryWrite(actor) {
   if (!['owner', 'manager'].includes(actor.role)) throw new ApiError(403, 'FORBIDDEN', 'Inventory changes require manager access');
 }
 
-export function createApp({ store = new Store(), secret } = {}) {
+export function createApp({ store = new Store(), secret, aiReply = generateReply } = {}) {
   const auth = new Auth(store, secret);
+  const aiAttempts = new Map();
   const server = createServer(async (req, res) => {
     const request_id = randomUUID();
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -150,6 +152,57 @@ if (
           for (const row of rows) counts[kind].by_status[row.status] = (counts[kind].by_status[row.status] || 0) + 1;
         }
         send(200, counts); return;
+      }
+      if (path === '/api/v1/conversations' && req.method === 'GET') {
+        const result = store.listConversations(actor, url.searchParams);
+        send(200, result.data, { ...result.pagination, counts: result.counts });
+        return;
+      }
+      if (path === '/api/v1/conversations' && req.method === 'POST') {
+        send(201, store.createConversation(await jsonBody(req), actor));
+        return;
+      }
+      const messageMatch = /^\/api\/v1\/conversations\/([a-zA-Z0-9-]+)\/messages$/.exec(path);
+      if (messageMatch) {
+        if (req.method === 'POST') {
+          const result = store.addMessage(messageMatch[1], await jsonBody(req), actor, req.headers['idempotency-key']);
+          send(result.replayed ? 200 : 201, result.message, { conversation_version: result.conversation_version, replayed: result.replayed });
+          return;
+        }
+        throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+      }
+      const suggestionMatch = /^\/api\/v1\/conversations\/([a-zA-Z0-9-]+)\/ai-suggestion$/.exec(path);
+      if (suggestionMatch) {
+        if (req.method === 'POST') {
+          const input = await jsonBody(req);
+          if (!input || Array.isArray(input) || typeof input !== 'object') throw new ApiError(422, 'VALIDATION_ERROR', 'Expected a JSON object');
+          for (const key of Object.keys(input)) if (!['tone', 'objective', 'language'].includes(key)) throw new ApiError(422, 'VALIDATION_ERROR', `Unknown field: ${key}`, { [key]: 'Unknown field' });
+          for (const key of ['tone', 'objective', 'language']) if (input[key] !== undefined && (typeof input[key] !== 'string' || input[key].length > 50)) throw new ApiError(422, 'VALIDATION_ERROR', `Invalid ${key}`, { [key]: 'Use a string of at most 50 characters' });
+          const now = Date.now();
+          const limit = aiAttempts.get(actor.id) || { count: 0, until: now + 60000 };
+          if (limit.until <= now) { limit.count = 0; limit.until = now + 60000; }
+          limit.count += 1;
+          aiAttempts.set(actor.id, limit);
+          if (limit.count > 20) throw new ApiError(429, 'RATE_LIMITED', 'Too many AI suggestions. Try again in a minute.');
+          const context = store.aiContext(suggestionMatch[1], actor);
+          const result = await aiReply({
+            vehicleFacts: buildVehicleFacts(context.vehicle),
+            question: context.question.body,
+            language: typeof input.language === 'string' ? input.language : context.conversation.reply_language,
+            tone: typeof input.tone === 'string' ? input.tone : 'friendly',
+            objective: typeof input.objective === 'string' ? input.objective : 'answer_question',
+          });
+          store.audit('conversations', suggestionMatch[1], actor, 'ai_suggestion_generated', { provider: result.provider, model: result.model, message_id: context.question.id, vehicle_id: context.vehicle.id });
+          send(200, { ...result, question: context.question.body, vehicle_id: context.vehicle.id, generated_at: new Date().toISOString() });
+          return;
+        }
+        throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+      }
+      const conversationMatch = /^\/api\/v1\/conversations\/([a-zA-Z0-9-]+)$/.exec(path);
+      if (conversationMatch) {
+        if (req.method === 'GET') { send(200, store.getConversation(conversationMatch[1], actor)); return; }
+        if (req.method === 'PATCH') { send(200, store.updateConversation(conversationMatch[1], await jsonBody(req), actor, version(req))); return; }
+        throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
       }
       const match = /^\/api\/v1\/(vehicles|customers|leads)(?:\/([a-zA-Z0-9-]+))?(?:\/(notes|activity|media)(?:\/([a-zA-Z0-9-]+))?)?$/.exec(path);
       if (!match) throw new ApiError(404, 'NOT_FOUND', 'Endpoint not found');

@@ -9,12 +9,13 @@ import { Readable, Writable } from 'node:stream';
 import { Store } from '../domain.mjs';
 import { createUser } from '../auth.mjs';
 import { createApp } from '../server.mjs';
+import { buildVehicleFacts, fallbackReply } from '../ai.mjs';
 
 const vehicle = (extra = {}) => ({ stock_number: 'A-1', vin: '1HGCM82633A004352', year: 2003, make: 'Honda', model: 'Accord', mileage: 80000, list_price: 8995, ...extra });
 async function fixture(t) {
   const store = new Store();
   const manager = createUser(store, { organization_id: randomUUID(), email: 'manager@example.com', password: 'test-password', name: 'Manager' });
-  const { server } = createApp({ store });
+  const { server } = createApp({ store, aiReply: fallbackReply });
   const network = process.env.DEALER_HTTP_TEST === '1';
   if (network) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); }
   const base = `http://127.0.0.1:${network ? server.address().port : 3000}`;
@@ -427,4 +428,132 @@ test('user management: invitation validation, revoke and tenant isolation', asyn
   assert.equal((await strangerApi('/users')).data.length, 1);
   assert.equal((await strangerApi(`/users/${manager.id}`, { method: 'PATCH', data: { status: 'disabled' } })).status, 404);
   assert.equal((await api(`/users/${stranger.id}`, { method: 'PATCH', data: { status: 'disabled' } })).status, 404);
+});
+
+test('conversations: vehicle-aware AI draft, idempotent messages and unread state', async t => {
+  const { api, store, manager, request } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ mileage: 34500, list_price: 24995, purchase_cost: 19000, minimum_price: 22000, internal_notes: 'internal floor plan note' }) })).data;
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Alex', last_name: 'Chen', email: 'alex@example.com', phone: '+14085550187' } })).data;
+  const created = await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'Is it still available and how many miles does it have?', channel: 'web' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.status, 'open');
+  assert.equal(created.data.customer.email, 'alex@example.com');
+  assert.equal(created.data.vehicle.id, car.id);
+  assert.equal(created.data.messages.length, 1);
+  assert.equal(created.data.messages[0].direction, 'inbound');
+  assert.equal(created.data.unread_count, 0);
+  const conversationId = created.data.id;
+
+  const suggestion = await api(`/conversations/${conversationId}/ai-suggestion`, { method: 'POST', data: { tone: 'friendly' } });
+  assert.equal(suggestion.status, 200);
+  assert.match(suggestion.data.draft, /34,500 miles/);
+  assert.match(suggestion.data.draft.toLowerCase(), /available/);
+  assert.equal(suggestion.data.provider, 'local');
+  assert.ok(suggestion.data.verification_notes.length > 0);
+  assert.equal(suggestion.data.draft.includes('internal floor plan note'), false);
+  assert.equal(suggestion.data.draft.includes('19,000'), false);
+  assert.equal(suggestion.data.draft.includes('22,000'), false);
+  assert.equal((await api(`/conversations/${conversationId}`)).data.messages.length, 1);
+
+  const payload = { body: 'Yes, it is available. Our team can confirm before your visit.', direction: 'outbound', ai_generated: true };
+  const sent = await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: payload, headers: { 'Idempotency-Key': 'message-key-1' } });
+  assert.equal(sent.status, 201);
+  assert.equal(sent.data.ai_generated, true);
+  assert.equal(sent.data.delivery_status, 'recorded');
+  const replay = await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: payload, headers: { 'Idempotency-Key': 'message-key-1' } });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.meta.replayed, true);
+  assert.equal(replay.data.id, sent.data.id);
+  assert.equal((await api(`/conversations/${conversationId}`)).data.messages.length, 2);
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'A different reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'message-key-1' } })).error.code, 'IDEMPOTENCY_CONFLICT');
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'No key', direction: 'outbound' } })).status, 428);
+
+  createUser(store, { organization_id: manager.organization_id, email: 'manager2@example.com', password: 'manager2-pass', name: 'Manager Two', role: 'manager' });
+  const login2 = await request('/auth/login', { method: 'POST', data: { email: 'manager2@example.com', password: 'manager2-pass' } });
+  const api2 = (path, options = {}) => request(path, { ...options, token: login2.data.access_token });
+  const list2 = await api2('/conversations');
+  assert.equal(list2.data.find(row => row.id === conversationId).unread_count, 1);
+  assert.equal(list2.meta.counts.unread, 1);
+  await api2(`/conversations/${conversationId}`);
+  assert.equal((await api2('/conversations')).data.find(row => row.id === conversationId).unread_count, 0);
+
+  const current = (await api(`/conversations/${conversationId}`)).data;
+  const closed = await api(`/conversations/${conversationId}`, { method: 'PATCH', version: current.version, data: { status: 'closed' } });
+  assert.equal(closed.status, 200);
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'closed reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'closed-key' } })).error.code, 'CONVERSATION_CLOSED');
+  assert.equal((await api(`/conversations/${conversationId}`, { method: 'PATCH', version: closed.data.version, data: { status: 'open' } })).status, 200);
+
+  const customerCurrent = (await api(`/customers/${customer.id}`)).data;
+  await api(`/customers/${customer.id}`, { method: 'PATCH', version: customerCurrent.version, data: { do_not_contact: true } });
+  assert.equal((await api(`/conversations/${conversationId}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'CONTACT_SUPPRESSED');
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'blocked', direction: 'outbound' }, headers: { 'Idempotency-Key': 'blocked-key' } })).error.code, 'CONTACT_SUPPRESSED');
+});
+
+test('conversation scope: sales and BDC visibility, assignment and access', async t => {
+  const { api, store, manager, request } = await fixture(t);
+  const salesA = createUser(store, { organization_id: manager.organization_id, email: 'conv.sales.a@example.com', password: 'sales-pass-123', name: 'Sales A', role: 'sales' });
+  const salesB = createUser(store, { organization_id: manager.organization_id, email: 'conv.sales.b@example.com', password: 'sales-pass-123', name: 'Sales B', role: 'sales' });
+  const bdc = createUser(store, { organization_id: manager.organization_id, email: 'conv.bdc@example.com', password: 'bdc-pass-123', name: 'BDC', role: 'bdc' });
+  const loginAs = async (email, password) => (await request('/auth/login', { method: 'POST', data: { email, password } })).data.access_token;
+  const as = token => (path, options = {}) => request(path, { ...options, token });
+  const a = as(await loginAs('conv.sales.a@example.com', 'sales-pass-123'));
+  const d = as(await loginAs('conv.bdc@example.com', 'bdc-pass-123'));
+
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const customerA = (await api('/customers', { method: 'POST', data: { first_name: 'Assigned A', assigned_user_id: salesA.id } })).data;
+  const customerB = (await api('/customers', { method: 'POST', data: { first_name: 'Assigned B', assigned_user_id: salesB.id } })).data;
+  const customerQueue = (await api('/customers', { method: 'POST', data: { first_name: 'Queue' } })).data;
+  const customerBdc = (await api('/customers', { method: 'POST', data: { first_name: 'BDC own', assigned_user_id: bdc.id } })).data;
+  const convA = (await api('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Question A', assigned_user_id: salesA.id } })).data;
+  const convB = (await api('/conversations', { method: 'POST', data: { customer_id: customerB.id, vehicle_id: car.id, message: 'Question B', assigned_user_id: salesB.id } })).data;
+  const convQueue = (await api('/conversations', { method: 'POST', data: { customer_id: customerQueue.id, vehicle_id: car.id, message: 'Queue question', assigned_user_id: null } })).data;
+  const convBdc = (await api('/conversations', { method: 'POST', data: { customer_id: customerBdc.id, vehicle_id: car.id, message: 'BDC question', assigned_user_id: bdc.id } })).data;
+
+  assert.deepEqual((await a('/conversations')).data.map(row => row.id), [convA.id]);
+  assert.equal((await a(`/conversations/${convB.id}`)).status, 404);
+  assert.equal((await a(`/conversations/${convB.id}/messages`, { method: 'POST', data: { body: 'blocked', direction: 'outbound' }, headers: { 'Idempotency-Key': 'scope-key' } })).status, 404);
+  assert.equal((await a(`/conversations/${convB.id}`, { method: 'PATCH', version: convB.version, data: { status: 'closed' } })).status, 404);
+
+  const own = await a('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Sales A own question' } });
+  assert.equal(own.status, 201);
+  assert.equal(own.data.assigned_user_id, salesA.id);
+  assert.equal((await a('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Assign away', assigned_user_id: salesB.id } })).status, 403);
+  assert.equal((await a(`/conversations/${convA.id}`, { method: 'PATCH', version: convA.version, data: { assigned_user_id: salesB.id } })).status, 403);
+  assert.equal((await a(`/conversations/${convA.id}`, { method: 'PATCH', version: convA.version, data: { assigned_user_id: salesA.id } })).status, 200);
+
+  assert.deepEqual((await d('/conversations')).data.map(row => row.id).sort(), [convQueue.id, convBdc.id].sort());
+  assert.equal((await d(`/conversations/${convA.id}`)).status, 404);
+  const claimed = await d(`/conversations/${convQueue.id}`, { method: 'PATCH', version: convQueue.version, data: { assigned_user_id: bdc.id } });
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.data.assigned_user_id, bdc.id);
+  assert.equal((await d(`/conversations/${convQueue.id}`, { method: 'PATCH', version: claimed.data.version, data: { assigned_user_id: salesA.id } })).status, 403);
+  assert.equal((await d(`/conversations/${convQueue.id}/messages`, { method: 'POST', data: { body: 'BDC reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'bdc-key' } })).status, 201);
+  assert.equal((await api('/conversations')).meta.total, 5);
+});
+
+test('conversation validation and AI privacy boundary', async t => {
+  const { api } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Alex' } })).data;
+  const noVehicle = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, message: 'Is it available?' } })).data;
+  assert.equal((await api(`/conversations/${noVehicle.id}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'VEHICLE_REQUIRED');
+  const noQuestion = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id } })).data;
+  assert.equal((await api(`/conversations/${noQuestion.id}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'NO_CUSTOMER_MESSAGE');
+  assert.equal((await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, channel: 'carrier-pigeon' } })).status, 422);
+  assert.equal((await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'Hello', unknown: true } })).status, 422);
+  assert.equal((await api(`/conversations/${noQuestion.id}`, { method: 'PATCH', data: { status: 'closed' } })).status, 428);
+  assert.equal((await api(`/conversations/${noVehicle.id}/ai-suggestion`, { method: 'POST', data: { unknown: true } })).status, 422);
+
+  const conversation = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'How many miles?' } })).data;
+  assert.equal((await api(`/conversations/${conversation.id}/messages`, { method: 'POST', data: { body: 'sideways', direction: 'sideways' } })).status, 422);
+
+  const facts = buildVehicleFacts({ year: 2022, make: 'Honda', model: 'Accord', mileage: 34500, list_price: 24995, purchase_cost: 19000, minimum_price: 22000, internal_notes: 'secret' });
+  assert.equal(facts.price_usd, 24995);
+  assert.equal(facts.mileage, 34500);
+  assert.equal('purchase_cost' in facts, false);
+  assert.equal('minimum_price' in facts, false);
+  assert.equal('internal_notes' in facts, false);
+  const soldVehicle = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2022, make: 'Honda', model: 'Accord', status: 'sold' }), question: 'Is it available?' });
+  assert.match(soldVehicle.draft.toLowerCase(), /sold/);
+  assert.equal(soldVehicle.provider, 'local');
 });

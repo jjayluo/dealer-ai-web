@@ -29,7 +29,7 @@ const initials = row => `${row?.first_name?.[0] || ''}${row?.last_name?.[0] || '
 const nameInitials = name => String(name || '?').split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join('').toUpperCase() || '?';
 const avatarTone = value => ['av-blue', 'av-pink', 'av-green', 'av-img'][Math.abs([...String(value || '')].reduce((sum, ch) => sum + ch.charCodeAt(0), 0)) % 4];
 const statuses = { vehicles: ['draft', 'available', 'pending', 'reserved', 'in_transit', 'sold'], customers: ['new', 'contacted', 'qualified', 'appointment', 'won', 'lost'], leads: ['new', 'working', 'qualified', 'won', 'lost'] };
-const moduleNames = { vehicles: 'Inventory', customers: 'Customers', leads: 'Leads', users: 'Users' };
+const moduleNames = { vehicles: 'Inventory', customers: 'Customers', leads: 'Leads', conversations: 'Conversations', users: 'Users' };
 const singular = { vehicles: 'vehicle', customers: 'customer', leads: 'lead', users: 'user' };
 const userRoles = ['owner', 'manager', 'sales', 'bdc'];
 const userStatuses = ['invited', 'active', 'disabled'];
@@ -41,13 +41,16 @@ const canWriteRecords = () => ['owner', 'manager', 'sales', 'bdc'].includes(acto
 let token = sessionStorage.getItem('dealer-token');
 let actor, kind = 'vehicles', page = 1, totalPages = 0, rows = [], filters = {}, generation = 0, photoUrls = [];
 let dialogContext;
+const conversationState = { items: [], selectedId: null, detail: null, page: 1, totalPages: 1, total: 0, filter: 'all', search: '', counts: { total: 0, open: 0, closed: 0, unread: 0 }, users: null, ai: null, aiUsed: false, sendKey: null };
+const uuid = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function notify(message, error = false) { $('#notice').textContent = message; $('#notice').classList.toggle('error', error); $('#notice').hidden = false; }
-async function api(path, { method = 'GET', data, version, form, raw = false } = {}) {
+async function api(path, { method = 'GET', data, version, form, raw = false, idempotencyKey } = {}) {
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   if (data !== undefined) headers['Content-Type'] = 'application/json';
   if (version !== undefined) headers['If-Match'] = String(version);
+  if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
   let response;
   try { response = await fetch(`/api/v1${path}`, { method, headers, body: form || (data === undefined ? undefined : JSON.stringify(data)) }); }
   catch { throw new Error('Cannot reach the server. Check the connection and try again.'); }
@@ -63,6 +66,7 @@ async function api(path, { method = 'GET', data, version, form, raw = false } = 
 }
 function signOut() {
   generation++; token = null; actor = null; sessionStorage.removeItem('dealer-token');
+  conversationState.items = []; conversationState.selectedId = null; conversationState.detail = null; conversationState.ai = null; conversationState.aiUsed = false; conversationState.sendKey = null; conversationState.users = null; conversationState.filter = 'all'; conversationState.search = '';
   closeDialog(); $('#workspace').hidden = true; $('#accept').hidden = true; $('#login').hidden = false; $('#login-form').elements.password.value = '';
 }
 const acceptParams = () => {
@@ -110,6 +114,8 @@ async function route() {
   closeDialog();
   const [module, query] = location.hash.slice(1).split('?');
   const params = new URLSearchParams(query || '');
+  $('#standard-view').hidden = false;
+  $('#conversation-view').hidden = true;
   if (module === 'users') {
     if (!manager()) { location.hash = '#vehicles'; return; }
     kind = 'users';
@@ -119,6 +125,11 @@ async function route() {
     document.querySelectorAll('nav a').forEach(link => link.classList.toggle('active', link.hash === '#users'));
     $('#filters').innerHTML = `<div class="filter-grid">${filterField('q', 'Search') + filterField('role', 'Role', userRoles.map(role => [role, roleLabel(role)])) + filterField('status', 'Status', userStatuses)}<button class="filter-btn" type="submit">Apply filters</button><button class="filter-btn" type="button" id="reset">Reset</button></div>`;
     await loadUsers();
+    return;
+  }
+  if (module === 'conversations') {
+    showConversationView();
+    await loadConversations();
     return;
   }
   kind = Object.hasOwn(moduleNames, module) ? module : 'vehicles';
@@ -146,7 +157,7 @@ window.addEventListener('hashchange', () => {
   if (actor) route().catch(error => notify(error.message, true));
   else { $('#workspace').hidden = true; $('#login').hidden = false; }
 });
-const badgeTone = { available: 'green', won: 'green', active: 'green', qualified: 'blue', invited: 'blue', contacted: 'blue', appointment: 'blue', new: 'blue', reserved: 'blue', pending: 'orange', working: 'orange', in_transit: 'orange', high: 'red', normal: 'blue', low: 'gray', lost: 'gray', sold: 'gray', disabled: 'gray', draft: 'gray' };
+const badgeTone = { available: 'green', won: 'green', active: 'green', open: 'green', qualified: 'blue', invited: 'blue', contacted: 'blue', appointment: 'blue', new: 'blue', reserved: 'blue', pending: 'orange', working: 'orange', in_transit: 'orange', high: 'red', normal: 'blue', low: 'gray', lost: 'gray', sold: 'gray', disabled: 'gray', draft: 'gray', closed: 'gray' };
 const badge = status => `<span class="badge ${badgeTone[status] || 'blue'}">${esc(title(status))}</span>`;
 async function load() {
   const sequence = ++generation;
@@ -230,6 +241,281 @@ async function loadUsers() {
     $('#results').innerHTML = '<p class="empty">Unable to load users. <button class="secondary-btn" data-action="retry">Retry</button></p>'; notify(error.message, true);
   }
 }
+function showConversationView() {
+  kind = 'conversations';
+  $('#page-title').textContent = 'Conversations';
+  $('#standard-view').hidden = true;
+  $('#conversation-view').hidden = false;
+  document.querySelectorAll('nav a').forEach(link => link.classList.toggle('active', link.hash === '#conversations'));
+  if (location.hash !== '#conversations') history.replaceState(null, '', `${location.pathname}#conversations`);
+}
+async function loadConversationUsers() {
+  if (!manager() || conversationState.users) return;
+  try { conversationState.users = (await api('/users')).data; } catch { conversationState.users = []; }
+}
+async function loadConversations() {
+  if (kind !== 'conversations') return;
+  try {
+    await loadConversationUsers();
+    await refreshConversationList();
+    if (kind !== 'conversations') return;
+    const selected = conversationState.items.find(item => item.id === conversationState.selectedId) || conversationState.items[0];
+    if (selected) await openConversation(selected.id);
+    else { conversationState.selectedId = null; conversationState.detail = null; renderConversationEmpty(); }
+  } catch (error) { notify(error.message, true); }
+}
+async function refreshConversationList() {
+  const params = new URLSearchParams({ page: conversationState.page, page_size: 20 });
+  if (conversationState.filter === 'open' || conversationState.filter === 'closed') params.set('status', conversationState.filter);
+  if (conversationState.filter === 'unread') params.set('unread_only', '1');
+  if (conversationState.search) params.set('q', conversationState.search);
+  const result = await api(`/conversations?${params}`);
+  const lastPage = Math.max(1, result.meta.total_pages);
+  if (conversationState.page > lastPage) { conversationState.page = lastPage; return refreshConversationList(); }
+  conversationState.items = result.data;
+  conversationState.counts = result.meta.counts || conversationState.counts;
+  conversationState.total = result.meta.total;
+  conversationState.totalPages = lastPage;
+  if (kind !== 'conversations') return;
+  renderConversationList();
+  renderConversationCounts();
+  renderConversationPagination();
+}
+function renderConversationList() {
+  const list = $('#conversation-list');
+  if (!conversationState.items.length) {
+    list.innerHTML = '<p class="empty">No conversations match these filters.</p>';
+    return;
+  }
+  list.innerHTML = conversationState.items.map(item => {
+    const customer = item.customer;
+    const name = fullName(customer) || 'Unknown customer';
+    const lastAt = item.last_message_at ? new Date(item.last_message_at) : null;
+    const time = lastAt ? (lastAt.toDateString() === new Date().toDateString() ? formatTime(lastAt) : formatDate(lastAt)) : '';
+    const preview = item.last_message_preview || 'No messages yet';
+    return `<button class="conversation-person ${item.id === conversationState.selectedId ? 'active' : ''}" type="button" data-conversation-id="${item.id}">
+      <span class="avatar ${avatarTone(customer?.id || name)}">${esc(initials(customer))}</span>
+      <span class="conversation-person-copy"><strong>${esc(name)}</strong><small>${esc(vehicleName(item.vehicle))}</small><small>${esc(preview.slice(0, 90))}</small></span>
+      <span class="conversation-person-meta"><small>${esc(time)}</small>${item.unread_count ? `<b>${item.unread_count}</b>` : ''}</span>
+    </button>`;
+  }).join('');
+}
+function renderConversationCounts() {
+  $('#conv-count-all').textContent = conversationState.counts.total || 0;
+  $('#conv-count-open').textContent = conversationState.counts.open || 0;
+  $('#conv-count-unread').textContent = conversationState.counts.unread || 0;
+  $('#conv-count-closed').textContent = conversationState.counts.closed || 0;
+  document.querySelectorAll('#conversation-tabs [data-filter]').forEach(tab => tab.classList.toggle('active', tab.dataset.filter === conversationState.filter));
+}
+function renderConversationPagination() {
+  const el = $('#conversation-pagination');
+  const total = conversationState.total;
+  if (conversationState.totalPages <= 1) {
+    el.innerHTML = `<span>${total} conversation${total === 1 ? '' : 's'}</span>`;
+    return;
+  }
+  el.innerHTML = `<button type="button" data-conv-page="${conversationState.page - 1}" ${conversationState.page <= 1 ? 'disabled' : ''}>Previous</button><span>Page ${conversationState.page} of ${conversationState.totalPages}</span><button type="button" data-conv-page="${conversationState.page + 1}" ${conversationState.page >= conversationState.totalPages ? 'disabled' : ''}>Next</button>`;
+}
+function renderConversationEmpty() {
+  $('#conversation-title').textContent = 'Conversations';
+  $('#conversation-subtitle').textContent = '';
+  $('#conversation-actions').innerHTML = '';
+  $('#conversation-messages').innerHTML = '<p class="empty">Select a conversation to view messages.</p>';
+  $('#conversation-composer').hidden = true;
+  $('#ai-suggestion-panel').hidden = true;
+  $('#conversation-context').innerHTML = '<p class="empty">Customer and vehicle context appears here.</p>';
+}
+async function openConversation(id) {
+  try {
+    const result = await api(`/conversations/${id}`);
+    if (kind !== 'conversations') return;
+    conversationState.detail = result.data;
+    conversationState.selectedId = id;
+    conversationState.ai = null;
+    conversationState.aiUsed = false;
+    conversationState.sendKey = null;
+    const item = conversationState.items.find(row => row.id === id);
+    if (item?.unread_count) {
+      item.unread_count = 0;
+      conversationState.counts.unread = Math.max(0, conversationState.counts.unread - 1);
+    }
+    await loadConversationUsers();
+    if (kind !== 'conversations') return;
+    renderConversationList();
+    renderConversationCounts();
+    renderConversationChat();
+  } catch (error) { notify(error.message, true); }
+}
+function renderConversationChat() {
+  const c = conversationState.detail;
+  if (!c) { renderConversationEmpty(); return; }
+  const customer = c.customer;
+  const vehicle = c.vehicle;
+  const name = fullName(customer) || 'Unknown customer';
+  $('#conversation-title').textContent = name;
+  $('#conversation-subtitle').textContent = `${vehicleName(vehicle)} · ${title(c.status)} · ${title(c.channel)}`;
+  $('#conversation-actions').innerHTML = `<button class="${c.status === 'open' ? 'outline-danger' : 'soft-button'}" type="button" id="toggle-conversation">${c.status === 'open' ? 'Close conversation' : 'Reopen conversation'}</button>`;
+  $('#conversation-messages').innerHTML = c.messages.length ? c.messages.map(renderMessage).join('') : '<p class="empty">No messages yet.</p>';
+  const messages = $('#conversation-messages');
+  messages.scrollTop = messages.scrollHeight;
+  const blocked = Boolean(customer?.do_not_contact);
+  const open = c.status === 'open';
+  $('#conversation-composer').hidden = false;
+  $('#message-input').disabled = !open || blocked;
+  $('#send-reply-btn').disabled = !open || blocked;
+  $('#ai-reply-btn').disabled = blocked || !vehicle;
+  $('#log-customer-message').disabled = !open;
+  $('#composer-status').textContent = blocked
+    ? 'This customer is marked do not contact. Sending and AI drafts are blocked.'
+    : !open
+      ? 'This conversation is closed. Reopen it to reply.'
+      : !vehicle
+        ? 'Link a vehicle to use AI replies. Messages are recorded in the CRM; external delivery is not configured.'
+        : 'AI suggestions require staff review. Messages are recorded in the CRM; external delivery is not configured.';
+  renderConversationContext();
+  renderAiPanel();
+}
+function renderMessage(message) {
+  const c = conversationState.detail;
+  const incoming = message.direction === 'inbound';
+  const who = incoming ? (fullName(c.customer) || 'Customer') : (message.sender_name || 'Staff');
+  const ai = message.ai_generated ? '<span class="message-ai">AI-assisted</span>' : '';
+  const recorded = !incoming && message.delivery_status === 'recorded' ? ' · recorded' : '';
+  return `<div class="message-group ${incoming ? 'incoming' : 'outgoing'}">
+    <div class="message-row">
+      ${incoming ? `<span class="mini-avatar ${avatarTone(c.customer?.id || who)}">${esc(initials(c.customer))}</span>` : ''}
+      <div class="message-bubble ${incoming ? 'incoming' : 'outgoing'}">${esc(message.body)}</div>
+    </div>
+    <div class="message-meta">${esc(who)} · ${esc(formatDateTime(message.created_at))}${ai}${recorded}</div>
+    ${message.original_body && message.original_body !== message.body ? `<div class="message-original">Original: ${esc(message.original_body)}</div>` : ''}
+  </div>`;
+}
+function renderConversationContext() {
+  const c = conversationState.detail;
+  if (!c) { $('#conversation-context').innerHTML = '<p class="empty">Customer and vehicle context appears here.</p>'; return; }
+  const customer = c.customer;
+  const vehicle = c.vehicle;
+  const lead = c.lead;
+  const name = fullName(customer) || 'Unknown customer';
+  const users = [...(conversationState.users || [])];
+  if (c.assigned_user && !users.some(user => user.id === c.assigned_user.id)) users.push(c.assigned_user);
+  const assignee = manager()
+    ? `<select id="conversation-assignee"><option value="">Unassigned</option>${users.map(user => `<option value="${user.id}" ${user.id === c.assigned_user_id ? 'selected' : ''}>${esc(user.name)} · ${esc(roleLabel(user.role))}</option>`).join('')}</select>`
+    : `<strong>${esc(c.assigned_user?.name || 'Unassigned')}</strong>`;
+  const vehicleBlock = vehicle
+    ? `<div class="vehicle-summary"><div class="vehicle-placeholder">${esc(vehicle.make || 'Vehicle')}<br>${esc(vehicle.model || '')}</div><div><strong>${esc(vehicleName(vehicle))}</strong><b>${money(vehicle.list_price)}</b><small>${Number(vehicle.mileage || 0).toLocaleString()} miles</small><small>${badge(vehicle.status)}</small></div></div>`
+    : '<p class="muted">No vehicle linked. Link a vehicle to use AI replies.</p>';
+  const leadBlock = lead
+    ? `<div><strong>${esc(title(lead.status))}</strong> · ${esc(title(lead.priority || 'normal'))}</div><div class="sub">${esc(lead.source || '—')} · ${lead.assigned_user_id ? 'Assigned' : 'Unassigned'}</div><p><a class="details-link" href="#leads?customer_id=${encodeURIComponent(customer?.id || '')}">Open customer leads</a></p>`
+    : '<p class="muted">No linked lead.</p>';
+  $('#conversation-context').innerHTML = `<h2>Customer Details</h2>
+    <div class="customer-profile-row"><span class="large-avatar ${avatarTone(customer?.id || name)}">${esc(initials(customer))}</span><div><h3>${esc(name)}</h3><small>${esc(customer?.phone || '—')}</small><small>${esc(customer?.email || '—')}</small>${customer?.do_not_contact ? '<small class="do-not-contact">Do not contact</small>' : ''}</div></div>
+    <div class="customer-info-block"><label>Language</label><strong>${esc(title(customer?.preferred_language || 'en'))}</strong></div>
+    <div class="customer-info-block"><label>Lead source</label><strong>${esc(customer?.lead_source || '—')}</strong></div>
+    <div class="customer-info-block"><h3>Interested Vehicle</h3>${vehicleBlock}</div>
+    <div class="customer-info-block"><h3>Lead</h3>${leadBlock}</div>
+    <div class="customer-info-block"><label>Conversation</label><div>${badge(c.status)}</div><div class="sub">Channel: ${esc(title(c.channel))} · ${esc(c.customer_language || 'en')} → ${esc(c.reply_language || 'en')}</div></div>
+    <div class="customer-info-block"><label>Assigned to</label><div class="conversation-context-actions">${assignee}</div></div>
+    <div class="customer-info-block"><h3>AI policy</h3><p class="muted">Assist mode only. Every AI draft requires staff review before sending.</p></div>`;
+}
+function renderAiPanel() {
+  const panel = $('#ai-suggestion-panel');
+  const ai = conversationState.ai;
+  if (!ai) { panel.hidden = true; panel.innerHTML = ''; return; }
+  const notes = Array.isArray(ai.verification_notes) && ai.verification_notes.length
+    ? `<ul>${ai.verification_notes.map(note => `<li>${esc(note)}</li>`).join('')}</ul>`
+    : '';
+  const source = ai.provider === 'openai'
+    ? `Generated with ${esc(ai.model || 'OpenAI')}.`
+    : 'Generated locally from recorded vehicle facts; no live model configured.';
+  panel.hidden = false;
+  panel.innerHTML = `<h3>✦ AI draft — review before sending</h3><div class="ai-draft">${esc(ai.draft)}</div>${notes}<div class="ai-note">${source}${ai.warning ? ` ${esc(ai.warning)}` : ''}</div><div class="ai-actions"><button class="secondary-btn" type="button" data-ai="regenerate">Regenerate</button><button class="blue-btn" type="button" data-ai="use">Use draft</button></div>`;
+}
+async function requestAiSuggestion() {
+  const c = conversationState.detail;
+  if (!c) return;
+  const button = $('#ai-reply-btn');
+  const original = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Generating…';
+  try {
+    const result = await api(`/conversations/${c.id}/ai-suggestion`, { method: 'POST', data: { language: c.reply_language || 'en' } });
+    conversationState.ai = result.data;
+    conversationState.aiUsed = false;
+    renderAiPanel();
+  } catch (error) { notify(error.message, true); }
+  finally { button.disabled = false; button.textContent = original; }
+}
+async function sendReply() {
+  const c = conversationState.detail;
+  if (!c) return;
+  const input = $('#message-input');
+  const body = input.value.trim();
+  if (!body) { notify('Enter a reply before sending.', true); return; }
+  const button = $('#send-reply-btn');
+  button.disabled = true;
+  conversationState.sendKey ||= uuid();
+  try {
+    await api(`/conversations/${c.id}/messages`, { method: 'POST', data: { body, direction: 'outbound', ai_generated: conversationState.aiUsed }, idempotencyKey: conversationState.sendKey });
+    input.value = '';
+    conversationState.ai = null;
+    conversationState.aiUsed = false;
+    conversationState.sendKey = null;
+    await openConversation(c.id);
+    await refreshConversationList();
+    notify('Reply recorded.');
+  } catch (error) { notify(error.message, true); }
+  finally {
+    const current = conversationState.detail;
+    button.disabled = !current || current.status !== 'open' || Boolean(current.customer?.do_not_contact);
+  }
+}
+async function toggleConversation() {
+  const c = conversationState.detail;
+  if (!c) return;
+  const button = $('#toggle-conversation');
+  if (button) button.disabled = true;
+  try {
+    const status = c.status === 'open' ? 'closed' : 'open';
+    await api(`/conversations/${c.id}`, { method: 'PATCH', version: c.version, data: { status } });
+    await openConversation(c.id);
+    await refreshConversationList();
+    notify(status === 'closed' ? 'Conversation closed.' : 'Conversation reopened.');
+  } catch (error) { notify(error.message, true); }
+  finally { const current = $('#toggle-conversation'); if (current) current.disabled = false; }
+}
+async function changeConversationAssignee(value) {
+  const c = conversationState.detail;
+  if (!c) return;
+  try {
+    await api(`/conversations/${c.id}`, { method: 'PATCH', version: c.version, data: { assigned_user_id: value || null } });
+    await openConversation(c.id);
+    await refreshConversationList();
+    notify('Assignment updated.');
+  } catch (error) { notify(error.message, true); renderConversationContext(); }
+}
+async function newConversationForm(prefill = {}) {
+  const [customers, vehicles] = await Promise.all([choices('customers'), choices('vehicles')]);
+  if (!customers.length) throw new Error('Create a customer first.');
+  if (!vehicles.length) throw new Error('Add a vehicle first.');
+  const customerOptions = customers.map(customer => [customer.id, `${fullName(customer)}${customer.email ? ` · ${customer.email}` : ''}`]);
+  const vehicleOptions = vehicles.map(vehicle => [vehicle.id, `${vehicleName(vehicle)} · ${vehicle.stock_number}`]);
+  const selectedVehicle = vehicles.some(vehicle => vehicle.id === prefill.vehicle_id) ? prefill.vehicle_id : vehicles[0].id;
+  const selectedCustomer = customers.some(customer => customer.id === prefill.customer_id) ? prefill.customer_id : customers[0].id;
+  dialogContext = {};
+  showDialog('New conversation', `<form id="conversation-form"><div class="editor-grid">
+    <label>Customer<select name="customer_id" required>${selectOptions(customerOptions, selectedCustomer)}</select></label>
+    <label>Vehicle<select name="vehicle_id" required>${selectOptions(vehicleOptions, selectedVehicle)}</select></label>
+    <label>Channel<select name="channel">${selectOptions([['web', 'Web'], ['email', 'Email'], ['phone', 'Phone'], ['sms', 'SMS'], ['facebook', 'Facebook'], ['whatsapp', 'WhatsApp']], 'web')}</select></label>
+    <label class="wide">Customer question<textarea name="message" required maxlength="5000" placeholder="What did the customer ask about this vehicle?"></textarea></label>
+  </div><p class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary-btn" data-close>Cancel</button><button class="blue-btn" type="submit">Start conversation</button></div></form>`);
+}
+function openCustomerMessageForm() {
+  const c = conversationState.detail;
+  if (!c) return;
+  dialogContext = { conversation: c };
+  showDialog('Log customer question', `<form id="customer-message-form"><label>Customer question<textarea name="body" required maxlength="5000" placeholder="Paste or type the customer's latest question..."></textarea></label><p class="form-error" role="alert"></p><div class="dialog-actions"><button type="button" class="secondary-btn" data-close>Cancel</button><button class="blue-btn" type="submit">Log question</button></div></form>`);
+}
 $('#add').addEventListener('click', () => {
   if (kind === 'users') { inviteUser(); return; }
   edit().catch(error => notify(error.message, true));
@@ -257,6 +543,67 @@ $('#results').addEventListener('click', async event => {
       if (confirm(`Archive this ${singular[kind]}? It will leave active lists; its history will be retained.`)) { await api(`/${kind}/${row.id}`, { method: 'DELETE', version: row.version }); notify('Record archived.'); await load(); }
     }
   } catch (error) { notify(error.message, true); } finally { button.disabled = false; }
+});
+$('#new-conversation').addEventListener('click', () => { newConversationForm().catch(error => notify(error.message, true)); });
+let conversationSearchTimer;
+$('#conversation-search').addEventListener('input', event => {
+  clearTimeout(conversationSearchTimer);
+  conversationSearchTimer = setTimeout(() => {
+    if (kind !== 'conversations') return;
+    conversationState.search = event.target.value.trim();
+    conversationState.page = 1;
+    loadConversations().catch(error => notify(error.message, true));
+  }, 250);
+});
+$('#conversation-tabs').addEventListener('click', event => {
+  const tab = event.target.closest('[data-filter]');
+  if (!tab) return;
+  conversationState.filter = tab.dataset.filter;
+  conversationState.page = 1;
+  loadConversations().catch(error => notify(error.message, true));
+});
+$('#conversation-list').addEventListener('click', event => {
+  const item = event.target.closest('[data-conversation-id]');
+  if (item) openConversation(item.dataset.conversationId);
+});
+$('#conversation-pagination').addEventListener('click', event => {
+  const button = event.target.closest('[data-conv-page]');
+  if (!button || button.disabled) return;
+  conversationState.page = Number(button.dataset.convPage);
+  loadConversations().catch(error => notify(error.message, true));
+});
+$('#conversation-actions').addEventListener('click', event => {
+  if (event.target.closest('#toggle-conversation')) toggleConversation();
+});
+$('#ai-suggestion-panel').addEventListener('click', event => {
+  const button = event.target.closest('[data-ai]');
+  if (!button) return;
+  if (button.dataset.ai === 'regenerate') { requestAiSuggestion(); return; }
+  const ai = conversationState.ai;
+  if (!ai) return;
+  const input = $('#message-input');
+  input.value = ai.draft;
+  input.focus();
+  conversationState.aiUsed = true;
+  conversationState.sendKey = null;
+  $('#ai-suggestion-panel').hidden = true;
+  $('#composer-status').textContent = 'AI-assisted draft. Review and edit before sending.';
+});
+$('#ai-reply-btn').addEventListener('click', () => requestAiSuggestion());
+$('#send-reply-btn').addEventListener('click', () => sendReply());
+$('#log-customer-message').addEventListener('click', openCustomerMessageForm);
+$('#message-input').addEventListener('input', () => { conversationState.sendKey = null; });
+$('#conversation-context').addEventListener('change', event => {
+  if (event.target.id === 'conversation-assignee') changeConversationAssignee(event.target.value);
+});
+$('#dialog-content').addEventListener('click', event => {
+  const button = event.target.closest('[data-action="start-conversation"]');
+  if (!button) return;
+  const vehicleId = button.dataset.id;
+  closeDialog();
+  showConversationView();
+  loadConversations().catch(error => notify(error.message, true));
+  newConversationForm({ vehicle_id: vehicleId }).catch(error => notify(error.message, true));
 });
 function closeDialog() { $('#editor').close(); for (const url of photoUrls) URL.revokeObjectURL(url); photoUrls = []; }
 $('#editor').addEventListener('close', () => { for (const url of photoUrls) URL.revokeObjectURL(url); photoUrls = []; });
@@ -347,6 +694,25 @@ $('#editor').addEventListener('submit', async event => {
       const name = String(formData.get('name') || '').trim();
       const result = await api('/users/invitations', { method: 'POST', data: { email: formData.get('email'), role: formData.get('role'), ...(name ? { name } : {}) } });
       closeDialog(); showInvitation(result.data); notify('Invitation created. Share the token securely.'); await loadUsers();
+    } else if (event.target.id === 'conversation-form') {
+      const data = Object.fromEntries(new FormData(event.target));
+      const result = await api('/conversations', { method: 'POST', data });
+      closeDialog();
+      notify('Conversation started.');
+      conversationState.filter = 'all';
+      conversationState.search = '';
+      conversationState.page = 1;
+      $('#conversation-search').value = '';
+      showConversationView();
+      await refreshConversationList();
+      await openConversation(result.data.id);
+    } else if (event.target.id === 'customer-message-form') {
+      const conversation = dialogContext.conversation;
+      await api(`/conversations/${conversation.id}/messages`, { method: 'POST', data: { body: event.target.elements.body.value, direction: 'inbound' } });
+      closeDialog();
+      notify('Customer question logged.');
+      await openConversation(conversation.id);
+      await refreshConversationList();
     } else if (event.target.id === 'note-form') {
       const id = dialogContext.record.id;
       await api(`/customers/${id}/notes`, { method: 'POST', data: { note_text: event.target.elements.note_text.value, is_pinned: event.target.elements.is_pinned.checked } }); notify('Note added.'); await detail(id);
@@ -374,7 +740,7 @@ async function detail(id) {
   if (detailKind === 'customers') {
     extra = `<h3>Notes</h3>${record.notes.length ? record.notes.map(note => `<div class="note">${note.is_pinned ? '📌 ' : ''}${esc(note.note_text)}<small>${esc(note.author_name || 'Unknown author')} · ${esc(formatDateTime(note.created_at))}</small></div>`).join('') : '<p class="muted">No notes yet.</p>'}${writable ? '<form id="note-form"><label>Add a note<textarea name="note_text" required maxlength="10000"></textarea></label><label><input type="checkbox" name="is_pinned">Pin note</label><p class="form-error" role="alert"></p><button class="blue-btn">Add note</button></form>' : ''}<p><a href="#leads?customer_id=${record.id}">View all ${record.lead_count} linked leads</a></p>`;
   } else if (detailKind === 'vehicles') {
-    extra = `<h3>Photos (${record.media.length}/10)</h3><div id="photos" class="photos"></div>${writable ? '<form id="photo-form"><label>JPEG or PNG · up to 10 MB<input name="file" type="file" accept="image/jpeg,image/png" required></label><p class="form-error" role="alert"></p><button class="blue-btn">Upload photo</button></form>' : ''}<p><a href="#leads?vehicle_id=${record.id}">View linked leads</a></p>`;
+    extra = `<h3>Photos (${record.media.length}/10)</h3><div id="photos" class="photos"></div>${writable ? '<form id="photo-form"><label>JPEG or PNG · up to 10 MB<input name="file" type="file" accept="image/jpeg,image/png" required></label><p class="form-error" role="alert"></p><button class="blue-btn">Upload photo</button></form>' : ''}<p><button class="secondary-btn" type="button" data-action="start-conversation" data-id="${record.id}">Start conversation</button> <a href="#leads?vehicle_id=${record.id}">View linked leads</a></p>`;
   }
   showDialog(detailKind === 'vehicles' ? vehicleName(record) : detailKind === 'customers' ? fullName(record) : 'Lead details', `<dl class="record-fields">${fields.map(([key, value]) => `<div><dt>${esc(title(key))}</dt><dd>${esc(displayValue(key, value))}</dd></div>`).join('')}</dl>${extra}<h3>Activity</h3><ol class="history">${history.data.map(item => `<li><strong>${esc(title(item.action))}</strong> · ${esc(formatDateTime(item.created_at))}<br>${esc(Object.entries(item.changes).map(([key, value]) => `${title(key)}: ${value && typeof value === 'object' ? `${value.before ?? '—'} → ${value.after ?? '—'}` : value}`).join('; '))}</li>`).join('')}</ol>`);
   if (detailKind === 'vehicles') {
