@@ -1,10 +1,15 @@
+import { policyReply } from './policy.mjs';
+
 const usd = value => Number.isFinite(Number(value))
   ? Number(value).toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
   : null;
 
 export function buildVehicleFacts(vehicle = {}) {
   const description = typeof vehicle.description === 'string' ? vehicle.description.slice(0, 1500) : null;
-  const historySummary = description && /CARFAX/i.test(description) ? description : null;
+  const historySummary = typeof vehicle.history_summary === 'string' && vehicle.history_summary.trim()
+    ? vehicle.history_summary.slice(0, 1500)
+    : description && /CARFAX/i.test(description) ? description.slice(0, 1500) : null;
+  const testMode = process.env.DEALER_AI_TEST_MODE === '1';
   return {
     stock_number: vehicle.stock_number ?? null,
     vin: vehicle.vin ?? null,
@@ -25,8 +30,24 @@ export function buildVehicleFacts(vehicle = {}) {
     fuel_type: vehicle.fuel_type ?? null,
     location: vehicle.location ?? null,
     description,
+    mileage_source: vehicle.mileage_source ?? null,
+    mileage_reported_at: vehicle.mileage_reported_at ?? null,
+    mileage_conflict: vehicle.mileage_conflict === true,
+    title_status: vehicle.title_status ?? null,
+    accident_count: Number.isInteger(vehicle.accident_count) ? vehicle.accident_count : null,
+    accident_summary: vehicle.accident_summary ?? null,
+    service_record_count: Number.isInteger(vehicle.service_record_count) ? vehicle.service_record_count : null,
+    last_service_date: vehicle.last_service_date ?? null,
     history_summary: historySummary,
-    inspection_notes: null,
+    history_report_date: vehicle.history_report_date ?? null,
+    report_available: Boolean(vehicle.history_report_date || vehicle.history_report_url),
+    hybrid_battery_status: vehicle.hybrid_battery_status ?? 'unknown',
+    smog_status: vehicle.smog_status ?? 'unknown',
+    ac_status: vehicle.ac_status ?? 'unknown',
+    inspection_notes: vehicle.inspection_notes ?? null,
+    inspection_conflict: vehicle.inspection_conflict === true,
+    test_current_mileage: testMode && Number.isInteger(vehicle.test_current_mileage) ? vehicle.test_current_mileage : null,
+    test_mileage_note: testMode ? vehicle.test_mileage_note ?? null : null,
   };
 }
 
@@ -66,7 +87,7 @@ export function fallbackReply({ vehicleFacts = {}, question = '', language = 'en
     answeredDetail = true;
   }
 
-  if (/\b(mile|miles|mileage|odometer)\b/.test(text) && Number.isFinite(Number(facts.mileage))) {
+  if (/\b(mile|miles|mileage|odometer)\b/.test(text) && facts.mileage !== null && facts.mileage !== undefined && Number.isFinite(Number(facts.mileage))) {
     sentences.push(`It has ${Number(facts.mileage).toLocaleString('en-US')} miles on record.`);
     answeredDetail = true;
   }
@@ -228,6 +249,8 @@ async function openaiReply({ vehicleFacts, question, language = 'en', tone = 'fr
 }
 
 export async function generateReply(input) {
+  const policy = policyReply(input);
+  if (policy) return policy;
   const provider = String(process.env.AI_PROVIDER || '').trim().toLowerCase();
   if (provider === 'local' || !process.env.OPENAI_API_KEY || !process.env.AI_MODEL) return fallbackReply(input);
   try {

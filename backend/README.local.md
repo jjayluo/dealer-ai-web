@@ -27,13 +27,15 @@ node backend/server.mjs
 
 AI 草稿可选配置 `OPENAI_API_KEY` 和 `AI_MODEL`；两者都存在时调用 OpenAI Responses API，否则使用本地确定性草稿。设置 `AI_PROVIDER=local` 可强制使用本地草稿。API key 只在服务端使用，不会返回浏览器。
 
+`DEALER_AI_TEST_MODE=1` 仅用于测试环境：允许 AI 使用车辆的 test-only current mileage，并在 staff notes 中标注 test-only。生产环境不得设置；默认关闭时 test-only 字段不会进入 AI facts，也不会进入草稿。
+
 Linux/WSL 下默认数据库为 `backend/data/dealer.sqlite`。**推荐在 WSL 的项目目录运行 Linux Node**，保持数据库和代码在同一文件系统。Windows Node 从 `\\wsl$` 网络路径启动时，SQLite 文件锁不能可靠工作，因此默认数据库置于 Windows 临时目录下按项目路径区分的 `dealer-ai-web/<项目标识>/dealer.sqlite`；能跨进程重启保留，但可能被临时文件清理。需要长期保留时，将 `DEALER_DB_PATH` 设为本机持久目录，或在 WSL 内运行。切换路径不会自动迁移数据库，迁移前停止服务并复制完整数据库。
 
 ## 已实现
 
 | 模块 | 功能 |
 | --- | --- |
-| 库存 | 新建、查看、编辑、归档（写操作仅 Owner/Manager）；草稿；VIN/库存号唯一检查；车型、品牌、状态、价格、关键词筛选；分页；真实统计；JPEG/PNG 照片上传、预览、删除（10 张，每张 10 MB）；价格、里程和年份校验 |
+| 库存 | 新建、查看、编辑、归档（写操作仅 Owner/Manager）；Make 下拉、Transmission 下拉（Automatic / Manual / CVT / eCVT / Other / Unknown）；CARFAX 里程来源/日期、事故/title/服务历史、检查状态和 test-only 字段；草稿；VIN/库存号唯一检查；车型、品牌、状态、价格、关键词筛选；分页；真实统计；JPEG/PNG 照片上传、预览、删除（10 张，每张 10 MB）；价格、里程和年份校验 |
 | 客户 | 档案、联系方式、意向车辆、负责人、状态、语言、禁止联系标记；联系方式标准化；同邮箱/电话的重复候选提示（保留独立客户，不自动合并）；备注、置顶备注、操作历史、关联线索；Sales/BDC 仅访问分配范围内的记录 |
 | 线索 | 新建、查看、编辑、归档；关联客户及车辆；来源、负责人、优先级、客户留言；阶段管理（`lost` 必填原因，重开必填原因）；外部来源编号去重；搜索筛选分页；阶段变化历史；Sales/BDC 仅访问分配范围内的记录 |
 | 用户 | 员工列表、邀请、接受邀请、角色调整、启用/禁用、撤销邀请；最后一个活动 Owner 保护；角色或状态变化立即使旧令牌失效 |
@@ -65,6 +67,25 @@ Linux/WSL 下默认数据库为 `backend/data/dealer.sqlite`。**推荐在 WSL �
 - 消息目前记录在 CRM 本地，`delivery_status` 为 `recorded`（出站）或 `received`（入站），不投递到短信/邮件；`channel` 只是上下文标签。
 - 未实现：自动回复、翻译、真实短信/邮件/WhatsApp 投递、公开网站询价入口。会话的暂停（snooze）也暂未启用。
 
+## 库存表单与 CARFAX 历史
+
+- Make 使用下拉列表；Transmission 固定为 `Automatic / Manual / CVT / eCVT / Other / Unknown`，CVT 与 eCVT 分开。
+- 车辆保存结构化历史：`mileage_source`、`mileage_reported_at`、`mileage_conflict`、`title_status`、`accident_count`、`accident_summary`、`service_record_count`、`last_service_date`、`history_summary`、`history_report_date`、`history_report_url`、`hybrid_battery_status`、`smog_status`、`ac_status`、`inspection_notes`、`inspection_conflict`。
+- CARFAX 报告的最后里程写入 `mileage`，报告日期写入 `mileage_reported_at`，来源写入 `CARFAX`。它是历史读数，不是实时里程。
+- `test_current_mileage` / `test_mileage_note` 是 manager-only 的测试字段；只有 `DEALER_AI_TEST_MODE=1` 时 AI 才会使用，并在 staff notes 中明确标注 test-only。生产环境默认不读取。
+- `history_report_url`、`mileage_conflict`、`inspection_conflict` 和 test-only 字段只对 Owner/Manager 返回；Sales/BDC 看不到。
+
+## AI 回复策略
+
+高风险问题由后端 policy 层生成，模型不能自由更改数字或承诺：
+
+- 可用性：使用最新 inventory status；不清楚时回答 “I’ll check availability for you before you make the trip.”
+- VIN/里程：VIN + “The last mileage reported on CARFAX was [miles] miles as of [date]” + 主动确认当前读数；缺失/冲突时转人工检查 odometer。
+- CARFAX/事故/title：有报告才提供报告；只有报告支持时才说 “no accidents reported”；title 单独说明；未验证的内容转人工。
+- Out-the-door：`GET /api/v1/vehicles/{id}/price-estimate?zip=91731[&cash=1]` 返回后端 itemized test estimate：车价 + 10% 税 + $50 title + $200 registration；$10,000 车价 → $11,250。现金折扣 $200，OTD 会用折扣后车价重算。真实报价必须转 sales。
+- 自有 registration、金融（<$8,000 / ≥$8,000 两套固定话术）、trade-in、混动电池、smog/AC、warranty、地址/营业时间/试驾、best price/$200 cash offer：都使用固定 policy 话术；没有记录的检查项要求人工确认。
+- `OPENAI_API_KEY` + `AI_MODEL` 只用于未命中 policy 的普通问题；policy 命中时返回 `provider: policy`，仍然只是 staff-reviewed draft。
+
 归档保留记录及历史，但从活动列表隐藏。有未关闭线索的车辆/客户不能归档，需先处理线索。已成交车辆不可通过普通编辑重新设为可售。**线索 won 是本模块的手工跟进结论，不会自动把车辆标记 sold，也不会创建销售订单。**
 
 ## 接口
@@ -85,6 +106,7 @@ Linux/WSL 下默认数据库为 `backend/data/dealer.sqlite`。**推荐在 WSL �
 | GET | `/api/v1/summary` | 三模块实时状态统计 |
 | GET / POST | `/api/v1/vehicles` | 库存列表（全员公开字段）/ 创建（Owner/Manager） |
 | GET / PATCH / DELETE | `/api/v1/vehicles/{id}` | 详情（全员公开字段）/ 编辑 / 归档（后两者 Owner/Manager） |
+| GET | `/api/v1/vehicles/{id}/price-estimate` | ZIP 91731 的 itemized test OTD estimate；`cash=1` 使用 $200 现金折扣并重算 |
 | GET / POST | `/api/v1/vehicles/{id}/media` | 照片列表 / multipart 上传（上传 Owner/Manager），字段名 `file` |
 | GET / DELETE | `/api/v1/vehicles/{id}/media/{mediaId}` | 读取（全员）/ 删除照片（Owner/Manager） |
 | GET / POST | `/api/v1/customers` | 客户列表（按角色范围）/ 创建（自动分配给 Sales/BDC 创建人） |
@@ -109,28 +131,28 @@ PATCH 和记录 DELETE 必须带 `If-Match: <version>`，version 来自最近一
 在项目根目录：
 
 ```sh
-node --test backend/test/api.test.mjs
+node --test backend/test/*.test.mjs
 ```
 
-默认直接执行实际 HTTP 请求处理器、JSON/multipart 序列化和真实 SQLite 数据操作，不依赖网络端口。覆盖身份验证、CRUD、分页、字段校验、唯一约束、并发版本、客户备注、关联关系、线索流转与原因校验、用户邀请/接受/撤销、角色与账号状态、令牌失效、最后一个 Owner 保护、租户隔离、角色和字段权限、Sales/BDC 分配范围、库存写权限、统计范围、会话/未读、AI 车辆事实与隐私边界、幂等发送、禁止联系拦截、照片限制和磁盘重启持久化。
+默认直接执行实际 HTTP 请求处理器、JSON/multipart 序列化和真实 SQLite 数据操作，不依赖网络端口。测试套件包含 **29 项**：22 项 API/持久化测试 + 7 项 AI policy/OTD/里程规则测试。覆盖身份验证、CRUD、分页、字段校验、唯一约束、并发版本、客户备注、关联关系、线索流转与原因校验、用户邀请/接受/撤销、角色与账号状态、令牌失效、最后一个 Owner 保护、租户隔离、角色和字段权限、Sales/BDC 分配范围、库存写权限、统计范围、会话/未读、AI 车辆事实与隐私边界、OTD 计算、里程/测试模式、幂等发送、禁止联系拦截、照片限制和磁盘重启持久化。
 
 也可运行相同测试的真实 TCP/HTTP 模式：
 
 ```sh
 # Linux / WSL
-DEALER_HTTP_TEST=1 node --test backend/test/api.test.mjs
+DEALER_HTTP_TEST=1 node --test backend/test/*.test.mjs
 ```
 
 ```powershell
 # PowerShell
 $env:DEALER_HTTP_TEST = '1'
-node --test backend/test/api.test.mjs
+node --test backend/test/*.test.mjs
 ```
 
 ## 本地版本边界
 
 这是可运行的本地核心功能版本，服务默认监听 `0.0.0.0` 并由 `APP_ORIGIN` 限制 Host/Origin，不是文档中完整的生产部署。技术上使用 Node 原生 HTTP + SQLite（JSON 字段存储、唯一索引及事务）；尚未采用文档规划的 NestJS、PostgreSQL、Next.js、S3。当前列表在门店数据范围内执行内存筛选，适用于本地小规模验证。
 
-AI 已接入**助审草稿**；未接入翻译、自动回复、短信/邮件/WhatsApp 真实投递、外部平台抓取、预约、交易结算，也未提供 refresh token、密码重置或完整的生产身份系统（如 MFA、邀请邮件发送）。经销商资料、时区、货币与 AI 策略设置（`/settings`）不在本次三个模块范围内。用户邀请在本版本中返回一次性令牌，需要管理员自行安全地转交。销售权限和门店隔离在接口层生效，但生产身份系统与账号生命周期管理仍需后续集成。备注/媒体的访问均需登录。照片目前仅验证 MIME、文件头和大小，不含生产要求的病毒扫描、解码重编码、EXIF 清理或主图排序。
+AI 已接入**助审草稿**；test-only current mileage 只在 `DEALER_AI_TEST_MODE=1` 的测试环境使用，生产环境必须关闭。OTD 是按当前测试费率计算的 **test estimate**，不是正式报价；税费和费用必须由 sales 确认。未接入翻译、自动回复、短信/邮件/WhatsApp 真实投递、外部平台抓取、预约、交易结算，也未提供 refresh token、密码重置或完整的生产身份系统（如 MFA、邀请邮件发送）。经销商资料、时区、货币与 AI 策略设置（`/settings`）不在本次三个模块范围内。用户邀请在本版本中返回一次性令牌，需要管理员自行安全地转交。销售权限和门店隔离在接口层生效，但生产身份系统与账号生命周期管理仍需后续集成。备注/媒体的访问均需登录。照片目前仅验证 MIME、文件头和大小，不含生产要求的病毒扫描、解码重编码、EXIF 清理或主图排序。
 
 首次启动必须提供 `DEALER_ADMIN_*`。发布前需要生产身份与会话管理、数据库迁移、备份、HTTPS 和媒体处理。根目录旧页面不再作为产品入口。

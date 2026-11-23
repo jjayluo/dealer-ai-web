@@ -9,13 +9,14 @@ import { Readable, Writable } from 'node:stream';
 import { Store } from '../domain.mjs';
 import { createUser } from '../auth.mjs';
 import { createApp } from '../server.mjs';
-import { buildVehicleFacts, fallbackReply } from '../ai.mjs';
+import { buildVehicleFacts, fallbackReply, generateReply } from '../ai.mjs';
 
 const vehicle = (extra = {}) => ({ stock_number: 'A-1', vin: '1HGCM82633A004352', year: 2003, make: 'Honda', model: 'Accord', mileage: 80000, list_price: 8995, ...extra });
 async function fixture(t) {
   const store = new Store();
   const manager = createUser(store, { organization_id: randomUUID(), email: 'manager@example.com', password: 'test-password', name: 'Manager' });
-  const { server } = createApp({ store, aiReply: fallbackReply });
+  process.env.AI_PROVIDER = 'local';
+  const { server } = createApp({ store, aiReply: generateReply });
   const network = process.env.DEALER_HTTP_TEST === '1';
   if (network) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); }
   const base = `http://127.0.0.1:${network ? server.address().port : 3000}`;
@@ -449,7 +450,7 @@ test('conversations: vehicle-aware AI draft, idempotent messages and unread stat
   assert.equal(suggestion.status, 200);
   assert.match(suggestion.data.draft, /34,500 miles/);
   assert.match(suggestion.data.draft.toLowerCase(), /available/);
-  assert.equal(suggestion.data.provider, 'local');
+  assert.equal(suggestion.data.provider, 'policy');
   assert.ok(suggestion.data.verification_notes.length > 0);
   assert.equal(suggestion.data.draft.includes('internal floor plan note'), false);
   assert.equal(suggestion.data.draft.includes('19,000'), false);
@@ -566,4 +567,24 @@ test('conversation validation and AI privacy boundary', async t => {
   assert.equal(historyReply.draft.includes('do not have verified accident'), false);
   const noHistoryReply = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2013, make: 'Toyota', model: 'Prius Two', status: 'available' }), question: 'Does it have any accident history?' });
   assert.match(noHistoryReply.draft, /do not have verified accident/i);
+});
+
+test('price estimate endpoint returns the itemized test out-the-door total', async t => {
+  const { api } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ list_price: 10000 }) })).data;
+  const standard = await api(`/vehicles/${car.id}/price-estimate?zip=91731`);
+  assert.equal(standard.status, 200);
+  assert.equal(standard.data.vehicle_price, 10000);
+  assert.equal(standard.data.tax, 1000);
+  assert.equal(standard.data.title, 50);
+  assert.equal(standard.data.registration, 200);
+  assert.equal(standard.data.total, 11250);
+  assert.equal(standard.data.test_only, true);
+  const cash = await api(`/vehicles/${car.id}/price-estimate?zip=91731&cash=1`);
+  assert.equal(cash.status, 200);
+  assert.equal(cash.data.cash_discount, 200);
+  assert.equal(cash.data.discounted_price, 9800);
+  assert.equal(cash.data.tax, 980);
+  assert.equal(cash.data.total, 11030);
+  assert.equal((await api(`/vehicles/${car.id}/price-estimate?zip=90000`)).status, 422);
 });

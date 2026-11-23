@@ -6,6 +6,7 @@ import { passwordHash } from './passwords.mjs';
 
 export const ROLES = ['owner', 'manager', 'sales', 'bdc'];
 export const USER_STATUSES = ['invited', 'active', 'disabled'];
+export const TRANSMISSIONS = ['Automatic', 'Manual', 'CVT', 'eCVT', 'Other', 'Unknown'];
 export const CONVERSATION_CHANNELS = ['web', 'email', 'phone', 'sms', 'facebook', 'whatsapp'];
 export const CONVERSATION_STATUSES = ['open', 'closed'];
 const roleRank = { owner: 3, manager: 2, sales: 1, bdc: 1 };
@@ -35,9 +36,27 @@ export const schemas = {
     make: { ...string, required: true }, model: { ...string, required: true }, trim: string,
     status: { ...enumRule('draft', 'available', 'pending', 'reserved', 'in_transit', 'sold'), default: 'available' },
     body_type: string, body_style: string, exterior_color: string, interior_color: string,
-    transmission: string, drivetrain: string, fuel_type: string,
+    transmission: { ...enumRule(...TRANSMISSIONS), default: 'Unknown' }, drivetrain: string, fuel_type: string,
     condition: { ...enumRule('new', 'used', 'certified'), default: 'used' },
     mileage: { type: 'number', integer: true, min: 0, max: 99999999, default: 0 },
+    mileage_source: { ...string, nullable: true, max: 40 },
+    mileage_reported_at: { ...string, nullable: true },
+    mileage_conflict: { type: 'boolean', default: false },
+    title_status: { ...string, nullable: true, max: 200 },
+    accident_count: { type: 'number', integer: true, min: 0, max: 100, nullable: true },
+    accident_summary: { ...text, nullable: true },
+    service_record_count: { type: 'number', integer: true, min: 0, max: 10000, nullable: true },
+    last_service_date: { ...string, nullable: true },
+    history_summary: { ...text, nullable: true },
+    history_report_date: { ...string, nullable: true },
+    history_report_url: { ...string, nullable: true, max: 500 },
+    hybrid_battery_status: { ...enumRule('unknown', 'inspected_good', 'needs_attention', 'replaced'), default: 'unknown' },
+    smog_status: { ...enumRule('unknown', 'passed', 'not_passed'), default: 'unknown' },
+    ac_status: { ...enumRule('unknown', 'works', 'not_working'), default: 'unknown' },
+    inspection_notes: { ...text, nullable: true },
+    inspection_conflict: { type: 'boolean', default: false },
+    test_current_mileage: { type: 'number', integer: true, min: 0, max: 99999999, nullable: true },
+    test_mileage_note: { ...string, nullable: true, max: 200 },
     list_price: { ...money, required: true }, purchase_cost: { ...money, nullable: true }, minimum_price: { ...money, nullable: true },
     location: string, description: text, internal_notes: text, acquired_at: { ...string, nullable: true }, acquisition_source: string,
   },
@@ -89,7 +108,9 @@ export function validate(kind, input, previous = {}) {
     if (data.vin && !/^[A-HJ-NPR-Z0-9]{17}$/.test(data.vin)) fail('vin', 'VIN must have 17 characters, excluding I, O and Q');
     if (data.status !== 'draft' && !data.vin) fail('vin', 'VIN is required outside draft status');
     if (data.minimum_price != null && data.minimum_price > data.list_price) fail('minimum_price', 'Minimum price cannot exceed list price');
-    if (data.acquired_at && (!/^\d{4}-\d{2}-\d{2}$/.test(data.acquired_at) || !Number.isFinite(Date.parse(data.acquired_at)) || new Date(data.acquired_at).toISOString().slice(0, 10) !== data.acquired_at)) fail('acquired_at', 'Use a valid YYYY-MM-DD date');
+    for (const field of ['acquired_at', 'mileage_reported_at', 'last_service_date', 'history_report_date']) {
+      if (data[field] && (!/^\d{4}-\d{2}-\d{2}$/.test(data[field]) || !Number.isFinite(Date.parse(data[field])) || new Date(data[field]).toISOString().slice(0, 10) !== data[field])) fail(field, 'Use a valid YYYY-MM-DD date');
+    }
   }
   if (kind === 'customers') {
     if (data.email) { data.email = data.email.toLowerCase(); if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.email)) fail('email', 'Invalid email address'); }
@@ -142,6 +163,10 @@ export class Store {
       CREATE INDEX IF NOT EXISTS customers_assigned ON customers(organization_id, json_extract(data, '$.assigned_user_id'));
       CREATE INDEX IF NOT EXISTS leads_assigned ON leads(organization_id, json_extract(data, '$.assigned_user_id'));
     `);
+    this.db.prepare(`UPDATE vehicles SET data = json_set(data, '$.transmission', 'Unknown')
+      WHERE json_extract(data, '$.transmission') IS NULL
+         OR json_extract(data, '$.transmission') = ''
+         OR json_extract(data, '$.transmission') NOT IN ('Automatic', 'Manual', 'CVT', 'eCVT', 'Other', 'Unknown')`).run();
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS conversations (
         id TEXT PRIMARY KEY,
@@ -229,6 +254,8 @@ export class Store {
     const result = { ...record };
     if (kind === 'vehicles' && !['owner', 'manager'].includes(actor.role)) {
       delete result.purchase_cost; delete result.minimum_price; delete result.internal_notes;
+      delete result.history_report_url; delete result.mileage_conflict; delete result.inspection_conflict;
+      delete result.test_current_mileage; delete result.test_mileage_note;
     }
     return result;
   }

@@ -9,6 +9,7 @@ import { Auth } from './auth.mjs';
 import { seed } from './seed.mjs';
 import { listRecords } from './query.mjs';
 import { buildVehicleFacts, generateReply } from './ai.mjs';
+import { DEALERSHIP, estimateOutTheDoor } from './policy.mjs';
 
 const directory = dirname(fileURLToPath(import.meta.url));
 const root = resolve(directory, '..');
@@ -182,6 +183,17 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
         if (req.method === 'GET') { send(200, store.getConversation(conversationMatch[1], actor)); return; }
         if (req.method === 'PATCH') { send(200, store.updateConversation(conversationMatch[1], await jsonBody(req), actor, version(req))); return; }
         throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+      }
+      const estimateMatch = /^\/api\/v1\/vehicles\/([a-zA-Z0-9-]+)\/price-estimate$/.exec(path);
+      if (estimateMatch) {
+        if (req.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+        const zip = url.searchParams.get('zip') || DEALERSHIP.otdZip;
+        if (zip !== DEALERSHIP.otdZip) throw new ApiError(422, 'VALIDATION_ERROR', 'This test estimate is only configured for ZIP 91731', { zip: 'Use ZIP 91731' });
+        const vehicle = store.get('vehicles', estimateMatch[1], actor);
+        const cash = ['1', 'true'].includes(String(url.searchParams.get('cash') || '').toLowerCase());
+        const estimate = estimateOutTheDoor({ price: vehicle.list_price, cashDiscount: cash ? DEALERSHIP.cashDiscount : 0, zip });
+        send(200, { ...estimate, vehicle_id: vehicle.id, stock_number: vehicle.stock_number });
+        return;
       }
       const match = /^\/api\/v1\/(vehicles|customers|leads)(?:\/([a-zA-Z0-9-]+))?(?:\/(notes|activity|media)(?:\/([a-zA-Z0-9-]+))?)?$/.exec(path);
       if (!match) throw new ApiError(404, 'NOT_FOUND', 'Endpoint not found');

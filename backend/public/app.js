@@ -31,6 +31,12 @@ const avatarTone = value => ['av-blue', 'av-pink', 'av-green', 'av-img'][Math.ab
 const statuses = { vehicles: ['draft', 'available', 'pending', 'reserved', 'in_transit', 'sold'], customers: ['new', 'contacted', 'qualified', 'appointment', 'won', 'lost'], leads: ['new', 'working', 'qualified', 'won', 'lost'] };
 const moduleNames = { vehicles: 'Inventory', customers: 'Customers', leads: 'Leads', conversations: 'Conversations', users: 'Users' };
 const singular = { vehicles: 'vehicle', customers: 'customer', leads: 'lead', users: 'user' };
+const vehicleMakes = ['Acura','Audi','BMW','Buick','Cadillac','Chevrolet','Chrysler','Dodge','Ferrari','Fiat','Ford','Genesis','GMC','Honda','Hummer','Hyundai','Infiniti','Isuzu','Jaguar','Jeep','Kia','Land Rover','Lexus','Lincoln','Lotus','Lucid','Maserati','Mazda','McLaren','Mercedes-Benz','MG','MINI','Mitsubishi','Nissan','Other','Pagani','Porsche','Ram','Rivian','Rolls-Royce','Subaru','Suzuki','Tesla','Toyota','Volkswagen','Volvo'];
+const transmissions = ['Automatic', 'Manual', 'CVT', 'eCVT', 'Other', 'Unknown'];
+const mileageSources = ['CARFAX', 'Dealer', 'Other', 'Unknown'];
+const hybridBatteryStatuses = [['unknown', 'Unknown'], ['inspected_good', 'Inspected — good condition'], ['needs_attention', 'Needs attention'], ['replaced', 'Replaced']];
+const smogStatuses = [['unknown', 'Unknown'], ['passed', 'Passed'], ['not_passed', 'Not passed']];
+const acStatuses = [['unknown', 'Unknown'], ['works', 'Works / blows cold'], ['not_working', 'Not working / needs attention']];
 const userRoles = ['owner', 'manager', 'sales', 'bdc'];
 const userStatuses = ['invited', 'active', 'disabled'];
 const roleLabel = role => ({ owner: 'Owner', manager: 'Manager', sales: 'Sales Rep', bdc: 'BDC' })[role] || title(role);
@@ -138,7 +144,7 @@ async function route() {
   $('#add').hidden = kind === 'vehicles' ? !canWriteInventory() : !canWriteRecords();
   $('#description').textContent = { vehicles: 'Manage vehicles, pricing and availability.', customers: 'Keep customer identity, interests and notes together.', leads: 'Track each purchase opportunity separately from the customer.' }[kind];
   document.querySelectorAll('nav a').forEach(link => link.classList.toggle('active', link.hash === `#${kind}`));
-  $('#filters').innerHTML = `<div class="filter-grid">${filterField('q', 'Search') + filterField('status', 'Status', statuses[kind]) + (kind === 'vehicles' ? filterField('make', 'Make') + filterField('body_type', 'Type', ['Sedan', 'SUV', 'Truck', 'Coupe', 'Van / Minivan', 'Convertible']) + filterField('price_min', 'Min price') + filterField('price_max', 'Max price') : filterField('source', 'Source') + (kind === 'leads' ? filterField('priority', 'Priority', ['low', 'normal', 'high']) : ''))}<button class="filter-btn" type="submit">Apply filters</button><button class="filter-btn" type="button" id="reset">Reset</button></div>`;
+  $('#filters').innerHTML = `<div class="filter-grid">${filterField('q', 'Search') + filterField('status', 'Status', statuses[kind]) + (kind === 'vehicles' ? filterField('make', 'Make', vehicleMakes) + filterField('body_type', 'Type', ['Sedan', 'SUV', 'Truck', 'Coupe', 'Van / Minivan', 'Convertible']) + filterField('price_min', 'Min price') + filterField('price_max', 'Max price') : filterField('source', 'Source') + (kind === 'leads' ? filterField('priority', 'Priority', ['low', 'normal', 'high']) : ''))}<button class="filter-btn" type="submit">Apply filters</button><button class="filter-btn" type="button" id="reset">Reset</button></div>`;
   await load();
 }
 function navigate(nextFilters = filters, nextPage = 1) {
@@ -427,7 +433,9 @@ function renderAiPanel() {
     : '';
   const source = ai.provider === 'openai'
     ? `Generated with ${esc(ai.model || 'OpenAI')}.`
-    : 'Generated locally from recorded vehicle facts; no live model configured.';
+    : ai.provider === 'policy'
+      ? 'Generated from dealership policy and recorded vehicle facts; staff review required.'
+      : 'Generated locally from recorded vehicle facts; no live model configured.';
   panel.hidden = false;
   panel.innerHTML = `<h3>✦ AI draft — review before sending</h3><div class="ai-draft">${esc(ai.draft)}</div>${notes}<div class="ai-note">${source}${ai.warning ? ` ${esc(ai.warning)}` : ''}</div><div class="ai-actions"><button class="secondary-btn" type="button" data-ai="regenerate">Regenerate</button><button class="blue-btn" type="button" data-ai="use">Use draft</button></div>`;
 }
@@ -624,8 +632,8 @@ async function edit(id) {
   const record = id ? (await api(`/${editKind}/${id}`)).data : {};
   let fields;
   if (editKind === 'vehicles') {
-    fields = [field('vin', 'VIN (required unless draft)'), field('stock_number', 'Stock number', 'text', true), field('year', 'Year', 'number', true), field('make', 'Make', 'text', true), field('model', 'Model', 'text', true), field('trim', 'Trim'), field('status', 'Status', 'select', true, [...statuses.vehicles]), field('body_type', 'Body type', 'select', false, ['Sedan', 'SUV', 'Truck', 'Coupe', 'Van / Minivan', 'Convertible']), field('mileage', 'Mileage (mi)', 'number', true), field('list_price', 'List price ($)', 'money', true), field('condition', 'Condition', 'select', true, ['used', 'new', 'certified']), field('fuel_type', 'Fuel type', 'select', false, ['Gasoline', 'Hybrid', 'Electric', 'Diesel', 'Plug-in Hybrid']), field('transmission', 'Transmission'), field('drivetrain', 'Drivetrain'), field('exterior_color', 'Exterior color'), field('interior_color', 'Interior color'), field('body_style', 'Body style'), field('acquired_at', 'Acquisition date', 'date'), field('acquisition_source', 'Acquisition source'), field('location', 'Location'), field('description', 'Description', 'textarea')];
-    if (['owner', 'manager'].includes(actor.role)) fields.push(field('purchase_cost', 'Purchase cost ($)', 'money'), field('minimum_price', 'Minimum price ($)', 'money'), field('internal_notes', 'Internal notes', 'textarea'));
+    fields = [field('vin', 'VIN (required unless draft)'), field('stock_number', 'Stock number', 'text', true), field('year', 'Year', 'number', true), field('make', 'Make', 'select', true, vehicleMakes), field('model', 'Model', 'text', true), field('trim', 'Trim'), field('status', 'Status', 'select', true, [...statuses.vehicles]), field('body_type', 'Body type', 'select', false, ['Sedan', 'SUV', 'Truck', 'Coupe', 'Van / Minivan', 'Convertible']), field('mileage', 'Mileage (mi)', 'number', true), field('list_price', 'List price ($)', 'money', true), field('condition', 'Condition', 'select', true, ['used', 'new', 'certified']), field('fuel_type', 'Fuel type', 'select', false, ['Gasoline', 'Hybrid', 'Electric', 'Diesel', 'Plug-in Hybrid']), field('transmission', 'Transmission', 'select', true, transmissions), field('drivetrain', 'Drivetrain'), field('exterior_color', 'Exterior color'), field('interior_color', 'Interior color'), field('body_style', 'Body style'), field('acquired_at', 'Acquisition date', 'date'), field('acquisition_source', 'Acquisition source'), field('location', 'Location'), field('description', 'Description', 'textarea'), field('mileage_source', 'Mileage source', 'select', false, mileageSources), field('mileage_reported_at', 'Mileage reported on', 'date'), field('mileage_conflict', 'Mileage needs verification / conflict', 'checkbox'), field('title_status', 'Title status'), field('accident_count', 'Reported accident/damage events', 'number'), field('accident_summary', 'Accident / damage summary', 'textarea'), field('service_record_count', 'Service record count', 'number'), field('last_service_date', 'Last service date', 'date'), field('history_summary', 'History summary', 'textarea'), field('history_report_date', 'History report date', 'date'), field('history_report_url', 'History report URL'), field('hybrid_battery_status', 'Hybrid battery status', 'select', false, hybridBatteryStatuses), field('smog_status', 'Smog status', 'select', false, smogStatuses), field('ac_status', 'A/C status', 'select', false, acStatuses), field('inspection_notes', 'Inspection notes', 'textarea'), field('inspection_conflict', 'Inspection conflicts with report', 'checkbox')];
+    if (manager()) fields.push(field('purchase_cost', 'Purchase cost ($)', 'money'), field('minimum_price', 'Minimum price ($)', 'money'), field('internal_notes', 'Internal notes', 'textarea'), field('test_current_mileage', 'Test-only current mileage (never sent to customers)', 'number'), field('test_mileage_note', 'Test-only mileage note', 'text'));
   } else {
     const [vehicles, users] = await Promise.all([choices('vehicles'), manager() ? api('/users') : Promise.resolve({ data: [] })]);
     const vehicleOptions = vehicles.map(v => [v.id, `${vehicleName(v)} · ${title(v.status)}`]);
@@ -639,7 +647,7 @@ async function edit(id) {
       fields = [field('customer_id', 'Customer', 'select', true, customers.map(c => [c.id, `${fullName(c)}${c.email ? ` · ${c.email}` : ''}`])), field('vehicle_id', 'Interested vehicle', 'select', false, vehicleOptions), field('source', 'Source', 'text', true), field('status', 'Stage', 'select', true, id ? transitions[record.status] : ['new']), field('priority', 'Priority', 'select', true, ['normal', 'high', 'low']), ...assignment, field('external_lead_id', 'External lead ID'), field('message', 'Customer message', 'textarea'), field('lost_reason', 'Lost reason (required when lost)', 'textarea'), field('reopen_reason', 'Reopen reason (required when reopening lost)', 'textarea')];
     }
   }
-  const defaults = { status: editKind === 'vehicles' ? 'available' : 'new', mileage: 0, preferred_language: 'en', condition: 'used', priority: 'normal' };
+  const defaults = { status: editKind === 'vehicles' ? 'available' : 'new', mileage: 0, preferred_language: 'en', condition: 'used', priority: 'normal', transmission: 'Unknown', mileage_source: 'Unknown', hybrid_battery_status: 'unknown', smog_status: 'unknown', ac_status: 'unknown' };
   for (const f of fields) if (f.type === 'select' && record[f.name] && !f.options.some(o => (Array.isArray(o) ? o[0] : o) === record[f.name])) f.options.push([record[f.name], `${record[f.name]} (current / archived)`]);
   if (kind !== editKind || !actor) return;
   dialogContext = { kind: editKind, record, fields };
