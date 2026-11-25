@@ -19,7 +19,7 @@ node backend/server.mjs
 
 - 访客入口为 `/app/#browse`，员工入口为 `/app/#login`。只有 available 且未归档的车辆可以公开查看和接收新询价。单门店自动识别，多门店数据库需用 `DEALER_PUBLIC_ORG_ID` 指定本站门店。
 - 产品入口：<http://localhost:3000/app/>
-- 首次启动只创建 Owner 账号，不生成车辆、客户或线索数据。
+- 首次启动且业务表为空时，会自动写入一组 sample data：3 台车辆、3 位客户、3 条线索和 3 个会话，便于部署后直接体验。已有任一车辆/客户/线索时不会写入，避免覆盖已有数据；设置 `DEALER_SEED_SAMPLE_DATA=0` 可关闭。
 - `DEALER_ADMIN_*` 仅在数据库首次初始化时使用，之后启动可省略。
 
 启动前可设置 `PORT`、`DEALER_DB_PATH`、`DEALER_ADMIN_EMAIL`、`DEALER_ADMIN_PASSWORD`、`DEALER_JWT_SECRET`、`APP_ORIGIN`。账号及密码仅在数据库首次初始化时生效；JWT 密钥不设置时每次启动重新生成，旧登录将失效。数据文件路径会打印在启动日志。

@@ -7,6 +7,7 @@ import { homedir } from 'node:os';
 import { Store, ApiError, schemas } from './domain.mjs';
 import { Auth } from './auth.mjs';
 import { seed } from './seed.mjs';
+import { seedSampleData } from './sample-data.mjs';
 import { listRecords } from './query.mjs';
 import { buildVehicleFacts, generateReply } from './ai.mjs';
 import { DEALERSHIP, estimateOutTheDoor } from './policy.mjs';
@@ -314,12 +315,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     store.close();
     process.exitCode = 1;
   } else {
+    let sampleData = null;
+    try { sampleData = seedSampleData(store); }
+    catch (error) { console.error('Sample data seeding failed:', error.message); }
     const { server } = createApp({ store, secret: process.env.DEALER_JWT_SECRET });
     const port = Number(process.env.PORT || 3000);
     server.listen(port, '0.0.0.0', () => {
       console.log(`DealerAI: http://localhost:${port}/app/`);
       console.log(`Database: ${databasePath}`);
       if (initialized) console.log(`Owner account created: ${email}`);
+      if (sampleData) console.log(`Sample data created: ${sampleData.vehicles} vehicles, ${sampleData.customers} customers, ${sampleData.leads} leads, ${sampleData.conversations} conversations`);
     });
     server.on('error', error => { console.error(error.message); store.close(); process.exitCode = 1; });
     for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => server.close(() => { store.close(); process.exit(); }));
