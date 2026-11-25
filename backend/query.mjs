@@ -9,8 +9,7 @@ export function listRecords(store, kind, params, actor) {
   const page = integer(params.get('page'), 'page', 1, 1000000);
   const page_size = integer(params.get('page_size'), 'page_size', 20, 100);
   let rows = store.all(kind, actor);
-  const relations = (type, id) => { if (!id) return null; try { return store.project(type, store.get(type, id, actor, true, true), actor); } catch { return null; } };
-  rows = rows.map(row => kind === 'leads' ? { ...row, customer: relations('customers', row.customer_id), vehicle: relations('vehicles', row.vehicle_id) } : kind === 'customers' ? { ...row, interested_vehicle: relations('vehicles', row.interested_vehicle_id) } : row);
+  rows = rows.map(row => kind === 'leads' ? { ...row, customer: store.related('customers', row.customer_id, actor), vehicle: store.related('vehicles', row.vehicle_id, actor) } : kind === 'customers' ? { ...row, interested_vehicle: store.related('vehicles', row.interested_vehicle_id, actor) } : row);
   for (const field of ['status', 'make', 'model', 'year', 'body_type', 'fuel_type', 'priority', 'assigned_user_id', 'customer_id', 'vehicle_id', 'interested_vehicle_id']) {
     const value = params.get(field);
     if (value) {
@@ -23,7 +22,7 @@ export function listRecords(store, kind, params, actor) {
   if (params.get('assignee')) rows = rows.filter(row => row.assigned_user_id === params.get('assignee'));
   const q = params.get('q')?.trim().toLowerCase();
   if (q) rows = rows.filter(row => {
-    const values = kind === 'vehicles' ? [row.vin, row.stock_number, row.make, row.model, row.trim, row.year, row.description] : kind === 'customers' ? [row.first_name, row.last_name, `${row.first_name} ${row.last_name || ''}`, row.email, row.phone] : [row.customer?.first_name, row.customer?.last_name, `${row.customer?.first_name} ${row.customer?.last_name || ''}`, row.vehicle?.make, row.vehicle?.model, row.source, row.message];
+    const values = kind === 'vehicles' ? [row.vin, row.stock_number, row.make, row.model, row.trim, row.year, row.description] : kind === 'customers' ? [row.first_name, row.last_name, `${row.first_name} ${row.last_name || ''}`, row.email, row.phone] : [row.customer?.first_name, row.customer?.last_name, `${row.customer?.first_name} ${row.customer?.last_name || ''}`, row.vehicle?.make, row.vehicle?.model, row.source, row.external_lead_id, row.message];
     return values.some(value => String(value ?? '').toLowerCase().includes(q));
   });
   for (const [name, compare] of [['price_min', (a, b) => a >= b], ['price_max', (a, b) => a <= b]]) {
@@ -40,5 +39,9 @@ export function listRecords(store, kind, params, actor) {
     rows = rows.filter(row => name === 'date_from' ? Date.parse(row.created_at) >= value : Date.parse(row.created_at) <= value);
   }
   const total = rows.length;
-  return { data: rows.slice((page - 1) * page_size, page * page_size).map(row => store.project(kind, row, actor)), pagination: { page, page_size, total, total_pages: Math.ceil(total / page_size) } };
+  return { data: rows.slice((page - 1) * page_size, page * page_size).map(row => {
+    const result = store.project(kind, row, actor);
+    if (kind === 'vehicles') result.primary_photo = store.media(row.id, actor)[0]?.url ?? null;
+    return result;
+  }), pagination: { page, page_size, total, total_pages: Math.ceil(total / page_size) } };
 }

@@ -7,17 +7,21 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import { Store } from '../domain.mjs';
+import { repairInquiry } from '../repair-inquiry.mjs';
 import { createUser } from '../auth.mjs';
 import { createApp } from '../server.mjs';
+import { buildVehicleFacts, fallbackReply, generateReply } from '../ai.mjs';
 
 const vehicle = (extra = {}) => ({ stock_number: 'A-1', vin: '1HGCM82633A004352', year: 2003, make: 'Honda', model: 'Accord', mileage: 80000, list_price: 8995, ...extra });
-async function fixture(t) {
+async function fixture(t, aiReply = generateReply) {
   const store = new Store();
   const manager = createUser(store, { organization_id: randomUUID(), email: 'manager@example.com', password: 'test-password', name: 'Manager' });
-  const { server } = createApp({ store });
+  process.env.AI_PROVIDER = 'local';
+  const { server } = createApp({ store, aiReply });
   const network = process.env.DEALER_HTTP_TEST === '1';
   if (network) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); }
   const base = `http://127.0.0.1:${network ? server.address().port : 3000}`;
+  process.env.APP_ORIGIN = base;
   // Exercise the same request handler without sockets in restricted environments.
   // DEALER_HTTP_TEST=1 runs these assertions over real HTTP instead.
   const fetchLocal = network ? fetch : async (url, options = {}) => {
@@ -115,7 +119,12 @@ test('customers persist notes, duplicate warnings, consent and multiple leads', 
   const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Alex', email: ' ALEX@example.com ', phone: '+1 (408) 555-9213', do_not_contact: true } })).data;
   assert.equal(customer.email, 'alex@example.com'); assert.equal(customer.phone, '+14085559213');
   const duplicate = await api('/customers', { method: 'POST', data: { first_name: 'Another', email: 'alex@example.com' } });
-  assert.equal(duplicate.status, 201); assert.equal(duplicate.meta.duplicate_candidates[0].id, customer.id);
+  assert.equal(duplicate.status, 409);
+  assert.deepEqual(duplicate.error.duplicate_candidates.map(c => c.id), [customer.id]);
+  assert.equal((await api('/customers')).meta.total, 1);
+  const distinct = await api('/customers', { method: 'POST', data: { first_name: 'Another', email: 'alex@example.com', duplicate_review: [customer.id] } });
+  assert.equal(distinct.status, 201);
+  assert.equal((await api(`/customers/${distinct.data.id}/activity`)).data[0].action, 'distinct_customer_confirmed');
   assert.equal((await api(`/customers/${customer.id}/notes`, { method: 'POST', data: { note_text: 'Call next week', is_pinned: true } })).status, 201);
   assert.equal((await api(`/customers/${customer.id}/notes`, { method: 'POST', data: { note_text: ' ' } })).status, 422);
   assert.equal((await api(`/customers/${customer.id}/notes`, { method: 'POST', data: { note_text: 'Hello', is_pinned: 'true' } })).status, 422);
@@ -135,11 +144,12 @@ test('lead lifecycle, assignment, external deduplication and audit history', asy
   assert.equal((await api('/leads', { method: 'POST', data })).status, 409);
   assert.equal((await api('/leads', { method: 'POST', data: { ...data, external_lead_id: '2', customer_id: randomUUID() } })).status, 422);
   assert.equal((await api(`/leads/${lead.id}`, { method: 'PATCH', version: 1, data: { status: 'won' } })).status, 409);
+  assert.equal((await api(`/leads/${lead.id}`, { method: 'PATCH', version: 1, data: { status: 'qualified' } })).status, 409);
   const working = await api(`/leads/${lead.id}`, { method: 'PATCH', version: 1, data: { status: 'working', priority: 'high' } }); assert.equal(working.status, 200);
   await api(`/leads/${lead.id}`, { method: 'PATCH', version: 2, data: { status: 'qualified' } });
-  const won = await api(`/leads/${lead.id}`, { method: 'PATCH', version: 3, data: { status: 'won' } }); assert.equal(won.status, 200);
+  const won = await api(`/leads/${lead.id}`, { method: 'PATCH', version: 3, data: { status: 'won' } }); assert.equal(won.status, 409);
   assert.equal((await api(`/leads/${lead.id}`, { method: 'PATCH', version: 4, data: { status: 'working' } })).status, 409);
-  assert.equal((await api(`/leads/${lead.id}/activity`)).data[0].changes.status.after, 'won');
+  assert.equal((await api(`/leads/${lead.id}/activity`)).data[0].changes.status.after, 'qualified');
 });
 
 test('lost and reopened leads require reasons', async t => {
@@ -206,17 +216,33 @@ test('multipart photo upload, retrieval, limit, validation and deletion', async 
   const { api, base, token, fetchLocal } = await fixture(t);
   const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/l9sAAAAASUVORK5CYII=', 'base64');
-  const upload = async (bytes, mime) => {
+  const upload = async (bytes, mime, primary = false) => {
     const form = new FormData(); form.append('file', new Blob([bytes], { type: mime }), 'photo.png');
+    if (primary) form.append('is_primary', 'true');
     const res = await fetchLocal(`${base}/api/v1/vehicles/${car.id}/media`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: form }); return { status: res.status, ...await res.json() };
   };
   assert.equal((await upload('not an image', 'image/png')).status, 422);
   const uploaded = await upload(png, 'image/png'); assert.equal(uploaded.status, 201);
   const response = await fetchLocal(base + uploaded.data.url, { headers: { Authorization: `Bearer ${token}` } }); assert.deepEqual(Buffer.from(await response.arrayBuffer()), png);
-  for (let i = 1; i < 10; i++) assert.equal((await upload(png, 'image/png')).status, 201);
+  assert.equal(uploaded.data.is_primary, true);
+  const second = await upload(png, 'image/png', true);
+  assert.equal(second.data.is_primary, true);
+  assert.equal((await api('/vehicles')).data[0].primary_photo, second.data.url);
+  const path = `/vehicles/${car.id}/media`;
+  const order = [uploaded.data.id, second.data.id];
+  const version = (await api(`/vehicles/${car.id}`)).data.version;
+  assert.equal((await api(path, { method: 'PATCH', version, data: { media_ids: [order[0], order[0]] } })).status, 422);
+  const moves = await Promise.all([order, [...order].reverse()].map(media_ids => api(path, { method: 'PATCH', version, data: { media_ids } })));
+  assert.deepEqual(moves.map(result => result.status).sort(), [200, 409]);
+  const photos = (await api(path)).data;
+  assert.equal(photos.filter(p => p.is_primary).length, 1);
+  assert.deepEqual(photos.map(p => p.id), moves.find(r => r.status === 200).data.map(p => p.id));
+  for (let i = 2; i < 10; i++) assert.equal((await upload(png, 'image/png')).status, 201);
   assert.equal((await upload(png, 'image/png')).status, 422);
   assert.equal((await api(`/vehicles/${car.id}/media/${uploaded.data.id}`, { method: 'DELETE' })).status, 204);
-  assert.equal((await api(`/vehicles/${car.id}/media`)).data.length, 9);
+  const remaining = (await api(path)).data;
+  assert.equal(remaining.length, 9);
+  assert.equal(remaining.filter(p => p.is_primary).length, 1);
 });
 
 test('sold inventory cannot be silently reopened', async t => {
@@ -427,4 +453,423 @@ test('user management: invitation validation, revoke and tenant isolation', asyn
   assert.equal((await strangerApi('/users')).data.length, 1);
   assert.equal((await strangerApi(`/users/${manager.id}`, { method: 'PATCH', data: { status: 'disabled' } })).status, 404);
   assert.equal((await api(`/users/${stranger.id}`, { method: 'PATCH', data: { status: 'disabled' } })).status, 404);
+});
+
+test('conversations: vehicle-aware AI draft, idempotent messages and unread state', async t => {
+  const { api, store, manager, request } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ mileage: 34500, list_price: 24995, purchase_cost: 19000, minimum_price: 22000, internal_notes: 'internal floor plan note' }) })).data;
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Alex', last_name: 'Chen', email: 'alex@example.com', phone: '+14085550187' } })).data;
+  const created = await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'Is it still available and how many miles does it have?', channel: 'web' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.status, 'open');
+  assert.equal(created.data.customer.email, 'alex@example.com');
+  assert.equal(created.data.vehicle.id, car.id);
+  assert.equal(created.data.messages.length, 1);
+  assert.equal(created.data.messages[0].direction, 'inbound');
+  assert.equal(created.data.unread_count, 0);
+  const conversationId = created.data.id;
+
+  const suggestion = await api(`/conversations/${conversationId}/ai-suggestion`, { method: 'POST', data: { tone: 'friendly' } });
+  assert.equal(suggestion.status, 200);
+  assert.match(suggestion.data.draft, /34,500 miles/);
+  assert.match(suggestion.data.draft.toLowerCase(), /available/);
+  assert.equal(suggestion.data.provider, 'policy');
+  assert.ok(suggestion.data.verification_notes.length > 0);
+  assert.equal(suggestion.data.draft.includes('internal floor plan note'), false);
+  assert.equal(suggestion.data.draft.includes('19,000'), false);
+  assert.equal(suggestion.data.draft.includes('22,000'), false);
+  assert.equal((await api(`/conversations/${conversationId}`)).data.messages.length, 1);
+
+  const payload = { body: 'Yes, it is available. Our team can confirm before your visit.', direction: 'outbound', ai_generated: true };
+  const sent = await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: payload, headers: { 'Idempotency-Key': 'message-key-1' } });
+  assert.equal(sent.status, 201);
+  assert.equal(sent.data.ai_generated, true);
+  assert.equal(sent.data.delivery_status, 'recorded');
+  const replay = await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: payload, headers: { 'Idempotency-Key': 'message-key-1' } });
+  assert.equal(replay.status, 200);
+  assert.equal(replay.meta.replayed, true);
+  assert.equal(replay.data.id, sent.data.id);
+  assert.equal((await api(`/conversations/${conversationId}`)).data.messages.length, 2);
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'A different reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'message-key-1' } })).error.code, 'IDEMPOTENCY_CONFLICT');
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'No key', direction: 'outbound' } })).status, 428);
+
+  createUser(store, { organization_id: manager.organization_id, email: 'manager2@example.com', password: 'manager2-pass', name: 'Manager Two', role: 'manager' });
+  const login2 = await request('/auth/login', { method: 'POST', data: { email: 'manager2@example.com', password: 'manager2-pass' } });
+  const api2 = (path, options = {}) => request(path, { ...options, token: login2.data.access_token });
+  const list2 = await api2('/conversations');
+  assert.equal(list2.data.find(row => row.id === conversationId).unread_count, 1);
+  assert.equal(list2.meta.counts.unread, 1);
+  await api2(`/conversations/${conversationId}`);
+  assert.equal((await api2('/conversations')).data.find(row => row.id === conversationId).unread_count, 0);
+
+  const current = (await api(`/conversations/${conversationId}`)).data;
+  const closed = await api(`/conversations/${conversationId}`, { method: 'PATCH', version: current.version, data: { status: 'closed' } });
+  assert.equal(closed.status, 200);
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'closed reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'closed-key' } })).error.code, 'CONVERSATION_CLOSED');
+  assert.equal((await api(`/conversations/${conversationId}`, { method: 'PATCH', version: closed.data.version, data: { status: 'open' } })).status, 200);
+
+  const customerCurrent = (await api(`/customers/${customer.id}`)).data;
+  await api(`/customers/${customer.id}`, { method: 'PATCH', version: customerCurrent.version, data: { do_not_contact: true } });
+  assert.equal((await api(`/conversations/${conversationId}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'CONTACT_SUPPRESSED');
+  assert.equal((await api(`/conversations/${conversationId}/messages`, { method: 'POST', data: { body: 'blocked', direction: 'outbound' }, headers: { 'Idempotency-Key': 'blocked-key' } })).error.code, 'CONTACT_SUPPRESSED');
+});
+
+test('conversation scope: sales and BDC visibility, assignment and access', async t => {
+  const { api, store, manager, request } = await fixture(t);
+  const salesA = createUser(store, { organization_id: manager.organization_id, email: 'conv.sales.a@example.com', password: 'sales-pass-123', name: 'Sales A', role: 'sales' });
+  const salesB = createUser(store, { organization_id: manager.organization_id, email: 'conv.sales.b@example.com', password: 'sales-pass-123', name: 'Sales B', role: 'sales' });
+  const bdc = createUser(store, { organization_id: manager.organization_id, email: 'conv.bdc@example.com', password: 'bdc-pass-123', name: 'BDC', role: 'bdc' });
+  const loginAs = async (email, password) => (await request('/auth/login', { method: 'POST', data: { email, password } })).data.access_token;
+  const as = token => (path, options = {}) => request(path, { ...options, token });
+  const a = as(await loginAs('conv.sales.a@example.com', 'sales-pass-123'));
+  const d = as(await loginAs('conv.bdc@example.com', 'bdc-pass-123'));
+
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const customerA = (await api('/customers', { method: 'POST', data: { first_name: 'Assigned A', assigned_user_id: salesA.id } })).data;
+  const customerB = (await api('/customers', { method: 'POST', data: { first_name: 'Assigned B', assigned_user_id: salesB.id } })).data;
+  const customerQueue = (await api('/customers', { method: 'POST', data: { first_name: 'Queue' } })).data;
+  const customerBdc = (await api('/customers', { method: 'POST', data: { first_name: 'BDC own', assigned_user_id: bdc.id } })).data;
+  const convA = (await api('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Question A', assigned_user_id: salesA.id } })).data;
+  const convB = (await api('/conversations', { method: 'POST', data: { customer_id: customerB.id, vehicle_id: car.id, message: 'Question B', assigned_user_id: salesB.id } })).data;
+  const convQueue = (await api('/conversations', { method: 'POST', data: { customer_id: customerQueue.id, vehicle_id: car.id, message: 'Queue question', assigned_user_id: null } })).data;
+  const convBdc = (await api('/conversations', { method: 'POST', data: { customer_id: customerBdc.id, vehicle_id: car.id, message: 'BDC question', assigned_user_id: bdc.id } })).data;
+
+  assert.deepEqual((await a('/conversations')).data.map(row => row.id), [convA.id]);
+  assert.equal((await a(`/conversations/${convB.id}`)).status, 404);
+  assert.equal((await a(`/conversations/${convB.id}/messages`, { method: 'POST', data: { body: 'blocked', direction: 'outbound' }, headers: { 'Idempotency-Key': 'scope-key' } })).status, 404);
+  assert.equal((await a(`/conversations/${convB.id}`, { method: 'PATCH', version: convB.version, data: { status: 'closed' } })).status, 404);
+
+  const own = await a('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Sales A own question' } });
+  assert.equal(own.status, 201);
+  assert.equal(own.data.assigned_user_id, salesA.id);
+  assert.equal((await a('/conversations', { method: 'POST', data: { customer_id: customerA.id, vehicle_id: car.id, message: 'Assign away', assigned_user_id: salesB.id } })).status, 403);
+  assert.equal((await a(`/conversations/${convA.id}`, { method: 'PATCH', version: convA.version, data: { assigned_user_id: salesB.id } })).status, 403);
+  assert.equal((await a(`/conversations/${convA.id}`, { method: 'PATCH', version: convA.version, data: { assigned_user_id: salesA.id } })).status, 200);
+
+  assert.deepEqual((await d('/conversations')).data.map(row => row.id).sort(), [convQueue.id, convBdc.id].sort());
+  assert.equal((await d(`/conversations/${convA.id}`)).status, 404);
+  const claimed = await d(`/conversations/${convQueue.id}`, { method: 'PATCH', version: convQueue.version, data: { assigned_user_id: bdc.id } });
+  assert.equal(claimed.status, 200);
+  assert.equal(claimed.data.assigned_user_id, bdc.id);
+  assert.equal((await d(`/conversations/${convQueue.id}`, { method: 'PATCH', version: claimed.data.version, data: { assigned_user_id: salesA.id } })).status, 403);
+  assert.equal((await d(`/conversations/${convQueue.id}/messages`, { method: 'POST', data: { body: 'BDC reply', direction: 'outbound' }, headers: { 'Idempotency-Key': 'bdc-key' } })).status, 201);
+  assert.equal((await api('/conversations')).meta.total, 5);
+});
+
+test('conversation validation and AI privacy boundary', async t => {
+  const { api } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Alex' } })).data;
+  const noVehicle = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, message: 'Is it available?' } })).data;
+  assert.equal((await api(`/conversations/${noVehicle.id}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'VEHICLE_REQUIRED');
+  const noQuestion = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id } })).data;
+  assert.equal((await api(`/conversations/${noQuestion.id}/ai-suggestion`, { method: 'POST', data: {} })).error.code, 'NO_CUSTOMER_MESSAGE');
+  assert.equal((await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, channel: 'carrier-pigeon' } })).status, 422);
+  assert.equal((await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'Hello', unknown: true } })).status, 422);
+  assert.equal((await api(`/conversations/${noQuestion.id}`, { method: 'PATCH', data: { status: 'closed' } })).status, 428);
+  assert.equal((await api(`/conversations/${noVehicle.id}/ai-suggestion`, { method: 'POST', data: { unknown: true } })).status, 422);
+
+  const conversation = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, vehicle_id: car.id, message: 'How many miles?' } })).data;
+  assert.equal((await api(`/conversations/${conversation.id}/messages`, { method: 'POST', data: { body: 'sideways', direction: 'sideways' } })).status, 422);
+
+  const facts = buildVehicleFacts({ year: 2022, make: 'Honda', model: 'Accord', mileage: 34500, list_price: 24995, purchase_cost: 19000, minimum_price: 22000, internal_notes: 'secret' });
+  assert.equal(facts.price_usd, 24995);
+  assert.equal(facts.mileage, 34500);
+  assert.equal('purchase_cost' in facts, false);
+  assert.equal('minimum_price' in facts, false);
+  assert.equal('internal_notes' in facts, false);
+  const soldVehicle = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2022, make: 'Honda', model: 'Accord', status: 'sold' }), question: 'Is it available?' });
+  assert.match(soldVehicle.draft.toLowerCase(), /sold/);
+  assert.equal(soldVehicle.provider, 'local');
+
+  const historyFacts = buildVehicleFacts({ year: 2013, make: 'Toyota', model: 'Prius Two', status: 'available', description: 'CARFAX report dated Sep 16, 2026: 3 owners, 2 reported minor damage events; title brands show no problems.' });
+  assert.match(historyFacts.history_summary, /2 reported minor damage events/);
+  const historyReply = fallbackReply({ vehicleFacts: historyFacts, question: 'Does it have any accident history?' });
+  assert.match(historyReply.draft, /report summary on file/i);
+  assert.match(historyReply.draft, /minor damage/i);
+  assert.equal(historyReply.draft.includes('do not have verified accident'), false);
+  const noHistoryReply = fallbackReply({ vehicleFacts: buildVehicleFacts({ year: 2013, make: 'Toyota', model: 'Prius Two', status: 'available' }), question: 'Does it have any accident history?' });
+  assert.match(noHistoryReply.draft, /do not have verified accident/i);
+});
+
+test('price estimate endpoint returns the itemized test out-the-door total', async t => {
+  const { api } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ list_price: 10000 }) })).data;
+  const standard = await api(`/vehicles/${car.id}/price-estimate?zip=91731`);
+  assert.equal(standard.status, 200);
+  assert.equal(standard.data.vehicle_price, 10000);
+  assert.equal(standard.data.tax, 1000);
+  assert.equal(standard.data.title, 50);
+  assert.equal(standard.data.registration, 200);
+  assert.equal(standard.data.total, 11250);
+  assert.equal(standard.data.test_only, true);
+  const cash = await api(`/vehicles/${car.id}/price-estimate?zip=91731&cash=1`);
+  assert.equal(cash.status, 200);
+  assert.equal(cash.data.cash_discount, 200);
+  assert.equal(cash.data.discounted_price, 9800);
+  assert.equal(cash.data.tax, 980);
+  assert.equal(cash.data.total, 11030);
+  assert.equal((await api(`/vehicles/${car.id}/price-estimate?zip=90000`)).status, 422);
+});
+
+test('anonymous catalog lists only the published dealership’s available stock', async t => {
+  const { api, request, store, manager } = await fixture(t);
+  const add = (stock_number, status = 'available', actor = manager) => store.save('vehicles', vehicle({
+    stock_number, status, vin: stock_number.padStart(17, '1'), internal_notes: 'staff only', minimum_price: 4000
+  }), actor);
+  const empty = await request('/public/vehicles');
+  assert.equal(empty.status, 200);
+  assert.deepEqual(empty.data, []);
+  const first = add('101');
+  const second = add('102');
+  const archived = add('103');
+  store.archive('vehicles', archived.id, manager, archived.version);
+  const hidden = ['draft', 'pending', 'reserved', 'in_transit', 'sold'].map((status, i) => add(String(200 + i), status));
+  for (const car of [archived, ...hidden]) {
+    assert.equal((await request(`/public/vehicles/${car.id}`)).status, 404);
+  }
+  const payload = { vehicle_id: hidden.at(-1).id, name: 'Visitor', email: 'visitor@example.test',
+    preferred_contact: 'email', consent: true, question: 'Still available?', submission_id: randomUUID() };
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: payload })).status, 404);
+  const pages = await Promise.all([1, 2].map(n => request(`/public/vehicles?page=${n}&page_size=1`)));
+  assert.equal(pages[0].meta.total, 2);
+  assert.deepEqual(new Set(pages.flatMap(p => p.data.map(v => v.id))), new Set([first.id, second.id]));
+  assert.ok(!('internal_notes' in pages[0].data[0]) && !('minimum_price' in pages[0].data[0]));
+  assert.equal((await request('/public/vehicles?page_size=0')).status, 422);
+  const other = createUser(store, { organization_id: randomUUID(), email: 'other@example.test', password: 'test-password', name: 'Other', role: 'owner' });
+  const foreign = add('301', 'available', other);
+  assert.equal((await request('/public/vehicles')).status, 503);
+  const previousOrg = process.env.DEALER_PUBLIC_ORG_ID;
+  process.env.DEALER_PUBLIC_ORG_ID = manager.organization_id;
+  t.after(() => { if (previousOrg === undefined) delete process.env.DEALER_PUBLIC_ORG_ID; else process.env.DEALER_PUBLIC_ORG_ID = previousOrg; });
+  assert.equal((await request('/public/vehicles')).meta.total, 2);
+  assert.equal((await request(`/public/vehicles/${foreign.id}`)).status, 404);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, vehicle_id: foreign.id } })).status, 404);
+  assert.equal((await api('/vehicles')).meta.total, 7);
+});
+
+test('public website inquiry creates a customer, lead and conversation with acknowledgement', async t => {
+  const { api, request } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ list_price: 24995, purchase_cost: 19000, minimum_price: 22000, internal_notes: 'private', test_current_mileage: 40000, test_mileage_note: 'test only' }) })).data;
+  const list = await request('/public/vehicles');
+  assert.deepEqual(list.data.map(vehicle => vehicle.id), [car.id]);
+  const summary = await request(`/public/vehicles/${list.data[0].id}`);
+  assert.equal(summary.status, 200);
+  assert.equal(summary.data.make, 'Honda');
+  for (const field of ['purchase_cost', 'minimum_price', 'internal_notes', 'test_current_mileage', 'test_mileage_note', 'history_report_url', 'mileage_conflict', 'inspection_conflict']) assert.equal(field in summary.data, false, field);
+
+  const payload = {
+    vehicle_id: car.id,
+    name: 'Taylor Buyer',
+    email: 'taylor@example.com',
+    phone: '+14085550111',
+    preferred_contact: 'email',
+    question: 'Is this car still available and what is the VIN?',
+    consent: true,
+    submission_id: randomUUID(),
+  };
+  const created = await request('/public/inquiries', { method: 'POST', data: payload });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.reference, payload.submission_id);
+  assert.equal(created.data.duplicate, false);
+  assert.equal(created.data.vehicle.id, car.id);
+  assert.equal('purchase_cost' in created.data.vehicle, false);
+  for (const key of ['customer_id', 'lead_id', 'conversation_id']) assert.equal(key in created.data, false);
+
+  const duplicate = await request('/public/inquiries', { method: 'POST', data: payload });
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicate.data.duplicate, true);
+  assert.equal(duplicate.data.reference, payload.submission_id);
+
+  const leads = await api(`/leads?q=${payload.submission_id}`);
+  assert.equal(leads.meta.total, 1);
+  const lead = leads.data[0];
+  assert.equal(lead.status, 'new');
+  assert.equal(lead.source, 'Website');
+  assert.equal(lead.external_lead_id, payload.submission_id);
+  assert.equal(lead.assigned_user_id ?? null, null);
+
+  const customers = await api(`/customers?q=${encodeURIComponent('taylor@example.com')}`);
+  assert.equal(customers.meta.total, 1);
+  const customer = customers.data[0];
+  assert.equal(customer.lead_source, 'Website');
+  assert.equal(customer.preferred_contact, 'email');
+  assert.equal(lead.customer_id, customer.id);
+
+  const conversations = await api('/conversations');
+  const conversation = conversations.data.find(row => row.vehicle_id === car.id);
+  assert.ok(conversation);
+  assert.equal(conversation.channel, 'web');
+  assert.equal(conversation.status, 'open');
+  assert.equal(conversation.assigned_user_id ?? null, null);
+  const detail = await api(`/conversations/${conversation.id}`);
+  assert.equal(detail.data.messages.length, 1);
+  assert.equal(detail.data.messages[0].direction, 'inbound');
+  assert.equal(detail.data.messages[0].body, payload.question);
+  assert.equal(detail.data.unread_count, 0);
+  assert.equal((await api('/leads?source=Website')).meta.total, 1);
+  assert.equal((await api('/customers')).meta.total, 1);
+  assert.equal((await api('/conversations')).meta.total, 1);
+  const unassignedWeb = await api('/conversations?channel=web&assigned_user_id=unassigned');
+  assert.equal(unassignedWeb.meta.total, 1);
+  assert.equal((await api('/conversations?channel=email')).meta.counts.total, 0);
+
+  const second = await request('/public/inquiries', { method: 'POST', data: { ...payload, submission_id: randomUUID(), question: 'Can I see it on Saturday?' } });
+  assert.equal(second.status, 201);
+  assert.equal((await api('/customers')).meta.total, 2);
+  const review = (await api(`/customers/${customer.id}`)).data;
+  assert.equal(review.duplicate_candidates.length, 1);
+  assert.equal(review.version, customer.version);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, question: 'Different question' } })).status, 409);
+  assert.equal((await api('/leads?source=Website')).meta.total, 2);
+  assert.equal((await api('/conversations')).meta.total, 2);
+
+  const other = (await api('/vehicles', { method: 'POST', data: vehicle({ stock_number: 'A-2', vin: '5YJ3E1EB7PF123456' }) })).data;
+  await api(`/vehicles/${other.id}`, { method: 'DELETE', version: 1 });
+  assert.equal((await request(`/public/vehicles/${other.id}`)).status, 404);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, vehicle_id: other.id, submission_id: randomUUID() } })).status, 404);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, consent: false, submission_id: randomUUID() } })).status, 422);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, email: '', phone: '', submission_id: randomUUID() } })).status, 422);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, email: '', preferred_contact: 'email', submission_id: randomUUID() } })).status, 422);
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: { ...payload, assigned_user_id: randomUUID(), submission_id: randomUUID() } })).status, 422);
+  assert.equal((await request('/customers')).status, 401);
+});
+
+test('draft mileage can be unknown and draft stock stays private', async t => {
+  const { api, request } = await fixture(t);
+  const stock = vehicle({ mileage: undefined });
+  assert.equal((await api('/vehicles', { method: 'POST', data: stock })).status, 422);
+  const draft = (await api('/vehicles', { method: 'POST', data: { ...stock, status: 'draft' } })).data;
+  assert.equal(draft.mileage ?? null, null);
+  assert.equal((await request(`/public/vehicles/${draft.id}`)).status, 404);
+  assert.equal((await api(`/vehicles/${draft.id}`, { method: 'PATCH', version: 1, data: { status: 'available', mileage: 0 } })).data.mileage, 0);
+});
+
+test('public inquiries preserve existing profiles and respect suppression on shared contacts', async t => {
+  const { api, request } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const original = (await api('/customers', { method: 'POST', data: { first_name: 'test', last_name: 'example', phone: '5550123456', preferred_contact: 'phone', do_not_contact: true } })).data;
+  const staffThread = (await api('/conversations', { method: 'POST', data: { customer_id: original.id, vehicle_id: car.id } })).data;
+  const submission = { vehicle_id: car.id, name: 'Cillian', phone: '555-012-3456', email: 'sam@example.com', preferred_contact: 'email', question: 'Can I visit?', consent: true, submission_id: randomUUID() };
+  assert.equal((await request('/public/inquiries', { method: 'POST', data: submission })).status, 201);
+  const matches = (await api('/conversations?q=Cillian')).data;
+  assert.equal(matches.length, 1);
+  const c = (await api(`/conversations/${matches[0].id}`)).data;
+  assert.equal(c.inquiry_name, 'Cillian');
+  assert.equal(c.customer.first_name, 'Cillian');
+  assert.equal(c.lead.customer_id, c.customer.id);
+  assert.equal(c.messages[0].body, submission.question);
+  assert.equal((await api(`/conversations/${staffThread.id}`)).data.customer.last_name, 'example');
+  assert.notEqual(c.customer.id, original.id);
+  assert.equal(c.customer.email, 'sam@example.com');
+  assert.equal(c.customer.do_not_contact, true);
+  const existing = (await api(`/customers/${original.id}`)).data;
+  assert.equal(existing.version, original.version);
+  assert.equal(existing.preferred_contact, 'phone');
+  const audit = (await api(`/customers/${c.customer.id}/activity`)).data[0];
+  assert.equal(audit.changes.consent, true);
+  assert.equal(audit.changes.submission_id, submission.submission_id);
+});
+
+test('a confirmed legacy inquiry repair only changes its linked records and is safe to retry', async t => {
+  const { store, manager, api, request } = await fixture(t);
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle() })).data;
+  const original = (await api('/customers', { method: 'POST', data: { first_name: 'Original', email: 'shared@example.com', do_not_contact: true } })).data;
+  const staff = (await api('/conversations', { method: 'POST', data: { customer_id: original.id } })).data;
+  const key = randomUUID();
+  await request('/public/inquiries', { method: 'POST', data: { vehicle_id: car.id, name: 'New buyer', email: original.email,
+    preferred_contact: 'email', consent: true, submission_id: key, question: 'Is it available?' } });
+  const inquiry = store.listConversations(manager).data.find(row => row.lead_id);
+  assert.throws(() => repairInquiry(store, staff.id, 'Cillian'));
+  assert.throws(() => repairInquiry(store, inquiry.id, 'Different name'));
+  // Recreate the links written by the legacy shared-contact lookup.
+  store.db.prepare('DELETE FROM inquiry_receipts WHERE submission_id = ?').run(key);
+  store.db.prepare('UPDATE conversations SET inquiry_name = NULL, customer_id = ? WHERE id = ?').run(original.id, inquiry.id);
+  store.db.prepare("UPDATE leads SET data = json_set(data, '$.customer_id', ?) WHERE id = ?").run(original.id, inquiry.lead_id);
+  const count = () => store.all('customers', manager).length;
+  const before = count();
+  assert.equal(repairInquiry(store, inquiry.id, 'Cillian'), true);
+  assert.equal(repairInquiry(store, inquiry.id, 'Cillian'), false);
+  assert.equal(count(), before + 1);
+  const corrected = store.getConversation(inquiry.id, manager);
+  assert.equal(corrected.inquiry_name, 'Cillian');
+  assert.equal(corrected.lead.customer_id, corrected.customer.id);
+  assert.equal(corrected.customer.first_name, 'Cillian');
+  assert.equal(corrected.customer.do_not_contact, true);
+  assert.ok(!corrected.customer.email);
+  assert.equal(corrected.messages[0].body, 'Is it available?');
+  assert.equal(store.getConversation(staff.id, manager).customer.id, original.id);
+  assert.equal(store.get('customers', original.id, manager).version, original.version);
+});
+
+test('opt out, channel destinations and message replay survive a state change', async t => {
+  const { api } = await fixture(t);
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Walk-in' } })).data;
+  const thread = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id } })).data;
+  const path = `/conversations/${thread.id}/messages`;
+  const record = (key, payload) => api(path, { method: 'POST', data: payload, headers: { 'Idempotency-Key': key } });
+  assert.equal((await record('email', { body: 'Hello', channel: 'email' })).status, 422);
+  const original = await record('reply', { body: 'Hello' });
+  assert.equal(original.status, 201);
+  assert.equal((await record('reply', { body: 'Hello', channel: 'sms' })).error.code, 'IDEMPOTENCY_CONFLICT');
+  await api(path, { method: 'POST', data: { direction: 'inbound', body: 'STOP' } });
+  assert.equal((await api(`/customers/${customer.id}`)).data.do_not_contact, true);
+  assert.equal((await record('another', { body: 'Hello' })).error.code, 'CONTACT_SUPPRESSED');
+  assert.equal((await record('reply', { body: 'Hello' })).data.id, original.data.id);
+  const messages = (await api(`/conversations/${thread.id}`)).data.messages;
+  assert.equal(messages.length, 2);
+});
+
+test('reassignment respects linked customer scope in search, detail and conversations', async t => {
+  const { manager, store, api, request } = await fixture(t);
+  const rep = createUser(store, { organization_id: manager.organization_id, email: 'rep@example.com', password: 'sample-password', name: 'Rep', role: 'sales' });
+  const login = await request('/auth/login', { method: 'POST', data: { email: rep.email, password: 'sample-password' } });
+  const asRep = path => request(path, { token: login.data.access_token });
+  const customer = (await api('/customers', { method: 'POST', data: { first_name: 'Private', email: 'private@example.com' } })).data;
+  const lead = (await api('/leads', { method: 'POST', data: { customer_id: customer.id, source: 'Store', assigned_user_id: rep.id } })).data;
+  const thread = (await api('/conversations', { method: 'POST', data: { customer_id: customer.id, lead_id: lead.id, assigned_user_id: rep.id } })).data;
+  assert.equal((await asRep('/leads?q=Private')).meta.total, 0);
+  assert.equal((await asRep(`/leads/${lead.id}`)).data.customer, null);
+  assert.equal((await asRep('/conversations?q=private%40example.com')).meta.total, 0);
+  assert.equal((await asRep(`/conversations/${thread.id}`)).data.customer, null);
+  assert.equal((await api(`/leads/${lead.id}`)).data.customer.id, customer.id);
+});
+
+test('suggestions use bounded history for the selected thread and discard stale results', async t => {
+  let capture;
+  let delayed = false;
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const { api } = await fixture(t, async input => {
+    capture = input;
+    if (delayed) { entered.resolve(); await resume.promise; }
+    return generateReply(input);
+  });
+  const car = (await api('/vehicles', { method: 'POST', data: vehicle({ list_price: 10000 }) })).data;
+  const buyer = (await api('/customers', { method: 'POST', data: { first_name: 'Buyer' } })).data;
+  const start = message => api('/conversations', { method: 'POST', data: { customer_id: buyer.id, vehicle_id: car.id, message } });
+  await start('Other thread, separate question');
+  const chat = (await start('Initial question')).data;
+  const path = '/conversations/' + chat.id;
+  const say = (direction, body) => api(path + '/messages', { method: 'POST', headers: { 'Idempotency-Key': randomUUID() }, data: { direction, body } });
+  for (let i = 0; i < 7; i++) await say('outbound', 'Old reply ' + i);
+  await say('inbound', 'A'.repeat(1500));
+  await say('inbound', 'What is the OTD price for ZIP 91731?');
+  await say('outbound', 'I can check our estimate.');
+  await say('inbound', 'What about cash?');
+  const suggest = () => api(path + '/ai-suggestion', { method: 'POST', data: {} });
+  const result = await suggest();
+  assert.equal(result.status, 200);
+  assert.match(result.data.draft, /\$11,030/);
+  assert.equal(capture.history.length, 8);
+  assert.equal(capture.history[0].body, 'Old reply 2');
+  assert.equal(capture.history[5].body.length, 1200);
+  assert.deepEqual({ ...capture.history.at(-1) }, { direction: 'outbound', body: 'I can check our estimate.' });
+  assert.equal(capture.history.some(turn => turn.body.includes('Other thread')), false);
+  delayed = true;
+  const pending = suggest();
+  await entered.promise;
+  await api('/vehicles/' + car.id, { method: 'PATCH', version: car.version, data: { list_price: 10900 } });
+  resume.resolve();
+  assert.equal((await pending).error.code, 'STALE_SUGGESTION');
 });

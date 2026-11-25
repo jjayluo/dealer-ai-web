@@ -1,11 +1,17 @@
-DealerAI Figma-style HTML Prototype
+DealerAI dealership workspace
+
+The working CRM is served at /app/ by backend/server.mjs. Use Node.js 24.14 or newer.
+First-run setup and tests: backend/README.local.md
+Backend entry points: backend/README.md
+
+Figma-style HTML prototype
 
 Open locally:
 1. Unzip DealerAI_Figma_Style.zip
-2. Open dashboard.html in Chrome/Safari
+2. Open index.html in Chrome/Safari
 
 Pages:
-- dashboard.html
+- index.html
 - inventory.html
 - customers.html
 - leads.html
