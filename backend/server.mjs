@@ -37,7 +37,7 @@ async function photoBody(req) {
   const bytes = await body(req, 10 * 1024 * 1024 + 4096);
   const marker = Buffer.from(`--${boundary}`);
   if (!bytes.subarray(0, marker.length).equals(marker)) throw new ApiError(400, 'INVALID_MULTIPART', 'Invalid multipart body');
-  let position = marker.length; let file;
+  let position = marker.length; let file, primary = false;
   while (bytes.subarray(position, position + 2).toString() !== '--') {
     if (bytes.subarray(position, position + 2).toString() !== '\r\n') throw new ApiError(400, 'INVALID_MULTIPART', 'Invalid multipart separator');
     const headerEnd = bytes.indexOf('\r\n\r\n', position);
@@ -48,11 +48,15 @@ async function photoBody(req) {
     if (/content-disposition: form-data;[^\r\n]*\bname="file"/i.test(header)) {
       if (file) throw new ApiError(422, 'VALIDATION_ERROR', 'Upload one file at a time');
       file = { bytes: bytes.subarray(headerEnd + 4, end), mime: /content-type:\s*([^\r\n]+)/i.exec(header)?.[1].toLowerCase() };
+    } else if (/content-disposition: form-data;[^\r\n]*\bname="is_primary"/i.test(header)) {
+      const value = bytes.subarray(headerEnd + 4, end).toString('utf8');
+      if (!['true', 'false', '1', '0'].includes(value)) throw new ApiError(422, 'VALIDATION_ERROR', 'Invalid primary photo selection');
+      primary = value === 'true' || value === '1';
     }
     position = end + 2 + marker.length;
   }
   if (!file || file.bytes.length > 10 * 1024 * 1024) throw new ApiError(422, 'VALIDATION_ERROR', 'A file of at most 10 MB is required');
-  return file;
+  return { ...file, primary };
 }
 function version(req) {
   const value = req.headers['if-match'];
@@ -67,6 +71,7 @@ function inventoryWrite(actor) {
 export function createApp({ store = new Store(), secret, aiReply = generateReply } = {}) {
   const auth = new Auth(store, secret);
   const aiAttempts = new Map();
+  const publicAttempts = new Map();
   const server = createServer(async (req, res) => {
     const request_id = randomUUID();
     res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -96,6 +101,33 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
         try { bytes = await readFile(file); } catch { throw new ApiError(404, 'NOT_FOUND', 'Page not found'); }
         res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'");
         res.writeHead(200, { 'Content-Type': types[extname(file)] }); res.end(req.method === 'HEAD' ? undefined : bytes); return;
+      }
+      if (path === '/api/v1/public/vehicles') {
+        if (req.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Use GET');
+        const result = store.publicVehicleList(url.searchParams);
+        send(200, result.data, result.pagination);
+        return;
+      }
+      const publicVehicleMatch = /^\/api\/v1\/public\/vehicles\/([a-zA-Z0-9-]+)$/.exec(path);
+      if (publicVehicleMatch) {
+        if (req.method !== 'GET') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+        const vehicle = store.publicVehicle(publicVehicleMatch[1]);
+        if (!vehicle) throw new ApiError(404, 'NOT_FOUND', 'Vehicle not found');
+        send(200, vehicle);
+        return;
+      }
+      if (path === '/api/v1/public/inquiries') {
+        if (req.method !== 'POST') throw new ApiError(405, 'METHOD_NOT_ALLOWED', 'Method not supported for this endpoint');
+        const address = req.socket.remoteAddress || 'unknown';
+        const now = Date.now();
+        const limit = publicAttempts.get(address) || { count: 0, until: now + 10 * 60 * 1000 };
+        if (limit.until <= now) { limit.count = 0; limit.until = now + 10 * 60 * 1000; }
+        limit.count += 1;
+        publicAttempts.set(address, limit);
+        if (limit.count > 20) throw new ApiError(429, 'RATE_LIMITED', 'Too many inquiries. Try again later.');
+        const result = store.createPublicInquiry(await jsonBody(req));
+        send(result.duplicate ? 200 : 201, result);
+        return;
       }
       if (path === '/api/v1/auth/login' && req.method === 'POST') { send(200, auth.login(await jsonBody(req), req.socket.remoteAddress)); return; }
       if (path === '/api/v1/auth/accept-invitation' && req.method === 'POST') { send(200, auth.issueToken(store.acceptInvitation(await jsonBody(req)))); return; }
@@ -168,10 +200,15 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
           const result = await aiReply({
             vehicleFacts: buildVehicleFacts(context.vehicle),
             question: context.question.body,
+            history: context.history,
             language: typeof input.language === 'string' ? input.language : context.conversation.reply_language,
             tone: typeof input.tone === 'string' ? input.tone : 'friendly',
             objective: typeof input.objective === 'string' ? input.objective : 'answer_question',
           });
+          const latest = store.aiContext(suggestionMatch[1], actor);
+          if (latest.conversation.version !== context.conversation.version || latest.vehicle.version !== context.vehicle.version) {
+            throw new ApiError(409, 'STALE_SUGGESTION', 'The conversation or vehicle changed. Refresh and generate a new draft.');
+          }
           store.audit('conversations', suggestionMatch[1], actor, 'ai_suggestion_generated', { provider: result.provider, model: result.model, message_id: context.question.id, vehicle_id: context.vehicle.id });
           send(200, { ...result, question: context.question.body, vehicle_id: context.vehicle.id, generated_at: new Date().toISOString() });
           return;
@@ -205,7 +242,13 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
       }
       if (kind === 'vehicles' && child === 'media') {
         if (!childId && req.method === 'GET') { send(200, store.media(id, actor)); return; }
-        if (!childId && req.method === 'POST') { inventoryWrite(actor); const file = await photoBody(req); send(201, store.addMedia(id, file.bytes, file.mime, actor)); return; }
+        if (!childId && req.method === 'POST') { inventoryWrite(actor); const file = await photoBody(req); send(201, store.addMedia(id, file.bytes, file.mime, actor, file.primary)); return; }
+        if (!childId && req.method === 'PATCH') {
+          inventoryWrite(actor);
+          const input = await jsonBody(req);
+          send(200, store.reorderMedia(id, input?.media_ids, actor, version(req)));
+          return;
+        }
         if (childId) {
           store.get('vehicles', id, actor);
           if (req.method === 'DELETE') inventoryWrite(actor);
@@ -213,7 +256,7 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
           if (!media) throw new ApiError(404, 'NOT_FOUND', 'Photo not found');
           if (req.method === 'GET') { res.writeHead(200, { 'Content-Type': media.mime }); res.end(Buffer.from(media.content)); return; }
           if (req.method === 'DELETE') {
-            store.transaction(() => { store.db.prepare('DELETE FROM media WHERE id = ? AND organization_id = ?').run(childId, actor.organization_id); store.audit(kind, id, actor, 'photo_deleted', { media_id: childId }); });
+            store.transaction(() => { store.db.prepare('DELETE FROM media WHERE id = ? AND organization_id = ?').run(childId, actor.organization_id); store.touchMedia(id, actor, 'photo_deleted', { media_id: childId }); });
             send(204); return;
           }
         }
@@ -223,10 +266,10 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
         if (req.method === 'GET' && id) {
           const record = store.project(kind, store.get(kind, id, actor), actor);
           for (const [field, target, name] of [['customer_id', 'customers', 'customer'], ['vehicle_id', 'vehicles', 'vehicle'], ['interested_vehicle_id', 'vehicles', 'interested_vehicle']]) {
-            if (record[field]) record[name] = store.project(target, store.get(target, record[field], actor, true, true), actor);
+            if (record[field]) record[name] = store.related(target, record[field], actor);
           }
           if (record.assigned_user_id) record.assigned_user = store.db.prepare('SELECT id, name FROM users WHERE id = ? AND organization_id = ?').get(record.assigned_user_id, actor.organization_id);
-          if (kind === 'customers') { record.notes = store.notes(id, actor); record.lead_count = store.all('leads', actor).filter(l => l.customer_id === id).length; }
+          if (kind === 'customers') { record.duplicate_candidates = store.duplicates(record, actor, id); record.notes = store.notes(id, actor); record.lead_count = store.all('leads', actor).filter(l => l.customer_id === id).length; }
           if (kind === 'vehicles') record.media = store.media(id, actor);
           res.setHeader('ETag', `"${record.version}"`); send(200, record); return;
         }
@@ -246,7 +289,7 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
       if (status === 500) console.error(`[${request_id}]`, error);
       if (!res.headersSent) {
         res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: { code: error.code && error.status ? error.code : 'INTERNAL_ERROR', message: error.status ? error.message : 'Unexpected server error', field_errors: error.field_errors || {}, request_id } }));
+        res.end(JSON.stringify({ error: { code: error.code && error.status ? error.code : 'INTERNAL_ERROR', message: error.status ? error.message : 'Unexpected server error', field_errors: error.field_errors || {}, ...(error.duplicate_candidates ? { duplicate_candidates: error.duplicate_candidates } : {}), request_id } }));
       } else res.end();
     }
   });
@@ -254,6 +297,8 @@ export function createApp({ store = new Store(), secret, aiReply = generateReply
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  try { process.loadEnvFile(resolve(directory, '.env')); }
+  catch (error) { if (error.code !== 'ENOENT') console.warn('Could not load backend/.env:', error.message); }
   // SQLite locking is unreliable over the Windows-to-WSL UNC share. Keep this
   // development database on the host's local disk when Node runs on Windows.
   const defaultDatabase = process.platform === 'win32' && directory.startsWith('\\\\')

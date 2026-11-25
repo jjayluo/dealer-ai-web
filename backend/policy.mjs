@@ -22,7 +22,7 @@ const dateLabel = value => {
 };
 
 export function estimateOutTheDoor({ price, cashDiscount = 0, zip = DEALERSHIP.otdZip } = {}) {
-  if (price === null || price === undefined || price === '' || !Number.isFinite(Number(price)) || Number(price) < 0) return null;
+  if (zip !== DEALERSHIP.otdZip || price === null || price === undefined || price === '' || !Number.isFinite(Number(price)) || Number(price) < 0) return null;
   const vehiclePrice = roundMoney(Number(price));
   const discount = roundMoney(Math.min(vehiclePrice, Math.max(0, Number(cashDiscount) || 0)));
   const discountedPrice = roundMoney(vehiclePrice - discount);
@@ -44,29 +44,31 @@ export function estimateOutTheDoor({ price, cashDiscount = 0, zip = DEALERSHIP.o
 
 function mileageReply(facts, testMode) {
   const notes = [];
+  if (facts.mileage_conflict) {
+    notes.push('Mileage records conflict or need verification.');
+    return { text: 'The mileage records need verification; our team can check the odometer before your visit.', notes };
+  }
+  const source = facts.mileage_source?.trim();
+  const reading = source?.toUpperCase() === 'CARFAX' ? 'The last mileage reported on CARFAX' : 'The mileage on record';
   if (testMode && facts.test_current_mileage !== null && facts.test_current_mileage !== undefined && Number.isFinite(Number(facts.test_current_mileage))) {
     const current = Number(facts.test_current_mileage);
     const parts = [`The current mileage on file is ${miles(current)} miles.`];
     if (facts.mileage !== null && facts.mileage !== undefined && Number.isFinite(Number(facts.mileage))) {
       const reported = dateLabel(facts.mileage_reported_at);
-      parts.push(`The last mileage reported on CARFAX was ${miles(facts.mileage)} miles${reported ? ` as of ${reported}` : ''}.`);
+      parts.push(`${reading} was ${miles(facts.mileage)} miles${reported ? ` as of ${reported}` : ''}.`);
     }
-    notes.push(`Test-only current mileage used (${miles(current)}). CARFAX reading remains ${facts.mileage !== null && facts.mileage !== undefined && Number.isFinite(Number(facts.mileage)) ? `${miles(facts.mileage)} miles${dateLabel(facts.mileage_reported_at) ? ` as of ${dateLabel(facts.mileage_reported_at)}` : ''}` : 'not available'}. Do not send this draft outside the test environment.`);
+    notes.push(`Test-only current mileage used (${miles(current)}). Recorded mileage remains ${facts.mileage !== null && facts.mileage !== undefined && Number.isFinite(Number(facts.mileage)) ? `${miles(facts.mileage)} miles${dateLabel(facts.mileage_reported_at) ? ` as of ${dateLabel(facts.mileage_reported_at)}` : ''}` : 'not available'}. Do not send this draft outside the test environment.`);
     notes.push('Staff must confirm the current odometer before a customer relies on it.');
     return { text: parts.join(' '), notes };
   }
-  if (facts.mileage_conflict) {
-    notes.push('Mileage records conflict or need verification.');
-    return { text: 'The mileage records need verification; our team can check the odometer before your visit.', notes };
-  }
   if (facts.mileage !== null && facts.mileage !== undefined && Number.isFinite(Number(facts.mileage))) {
     const reported = dateLabel(facts.mileage_reported_at);
-    notes.push(`Mileage source: ${facts.mileage_source || 'CARFAX'}${reported ? `; reading date ${reported}` : '; reading date not reported'}.`);
-    notes.push('Staff must confirm the current odometer; the CARFAX reading is not a live reading.');
+    notes.push(`Mileage source: ${source || 'unknown'}${reported ? `; reading date ${reported}` : '; reading date not reported'}.`);
+    notes.push('Staff must confirm the current odometer; the recorded mileage may have changed.');
     return {
       text: reported
-        ? `The last mileage reported on CARFAX was ${miles(facts.mileage)} miles as of ${reported}. Our team can confirm the current reading before your visit.`
-        : `The last mileage reported on CARFAX was ${miles(facts.mileage)} miles; the reading date is not reported. Our team can confirm the current reading before your visit.`,
+        ? `${reading} was ${miles(facts.mileage)} miles as of ${reported}. Our team can confirm the current reading before your visit.`
+        : `${reading} was ${miles(facts.mileage)} miles; the reading date is not reported. Our team can confirm the current reading before your visit.`,
       notes,
     };
   }
@@ -117,14 +119,14 @@ function accidentAndTitleReply(facts) {
 function financingReply(facts, question) {
   const price = facts.price_usd === null || facts.price_usd === undefined || facts.price_usd === '' ? null : Number(facts.price_usd);
   const downMatch = question.match(/\$?\s*([\d,]+)\s*(?:down|down payment)/i);
-  const down = downMatch ? Number(downMatch[1].replaceAll(',', '')) : 2000;
+  const down = downMatch ? Number(downMatch[1].replaceAll(',', '')) : null;
   const notes = ['Do not promise approval, a specific APR, term, lease or monthly payment.'];
   if (!Number.isFinite(price)) return { text: 'Our sales team can review financing options with you; please visit so they can explain what may be available.', notes };
   if (price < DEALERSHIP.financeThreshold) {
     return { text: 'We generally recommend paying in full, but our sales team can review financing options with you.', notes };
   }
   return {
-    text: `We offer financing. Please visit so our sales team can review what ${money(down)} down could look like and, with your permission, check your credit. We may have options for buyers with low credit or no SSN, subject to lender requirements and approval.`,
+    text: `We offer financing. Please visit so our sales team can review ${down === null ? 'your down payment options' : `what ${money(down)} down could look like`} and, with your permission, check your credit. We may have options for buyers with low credit or no SSN, subject to lender requirements and approval.`,
     notes,
   };
 }
@@ -161,6 +163,10 @@ function hybridBatteryReply(facts, question) {
 function smogAcReply(facts, asksSmog, asksAc) {
   const parts = [];
   const notes = [];
+  if (facts.inspection_conflict) {
+    return { text: 'The inspection records conflict. Our team will need to verify the inspection results before answering.',
+      notes: ['Resolve the conflicting inspection records before making a claim.'] };
+  }
   if (asksSmog) {
     if (facts.smog_status === 'passed') parts.push('The vehicle passed smog.');
     else if (facts.smog_status === 'not_passed') { parts.push('The smog check is not passed; our sales team can review it with you.'); notes.push('Smog not passed; sales review required.'); }
@@ -176,30 +182,51 @@ function smogAcReply(facts, asksSmog, asksAc) {
   return { text: parts.join(' '), notes };
 }
 
-function locationTestDriveReply(asksLocation, asksTestDrive) {
+function locationTestDriveReply(asksLocation, asksTestDrive, proposedTime) {
   const parts = [];
   if (asksLocation) parts.push(`We’re at ${DEALERSHIP.address}.`);
-  if (asksTestDrive) parts.push('Let me know what time works for you, and our sales team can confirm the appointment.');
+  if (asksTestDrive && proposedTime) parts.push(`I’ll ask our team to check ${proposedTime} and confirm the appointment with you.`);
+  else if (asksTestDrive) parts.push('Let me know what time works for you, and our sales team can confirm the appointment.');
   parts.push(DEALERSHIP.hours);
   return parts.join(' ');
 }
 
-function bestPriceReply(question) {
-  const cash = /\bcash\b/i.test(question);
+function bestPriceReply(cash) {
   const parts = ['There may be a little room on price. Come take a look at the car, and I’ll definitely give you my best price.'];
   if (cash) parts.push(`If you pay cash, we can offer ${money(DEALERSHIP.cashDiscount)} off. Anything beyond that would need sales approval.`);
   else parts.push('Any discount beyond the approved cash offer goes to our sales team.');
   return parts.join(' ');
 }
 
-function otdReply(facts, question) {
+const otdTopic = /out[- ]?the[- ]?door|\botd\b|total (?:price|cost)|after[- ]tax(?:es)?\b|\b(?:with|including|plus|before and after) (?:sales )?tax(?:es)?\b|\btax(?:es)? and fees\b|\bhow much (?:is|are|would) (?:the )?(?:sales )?tax(?:es)?\b|^\s*(?:sales )?tax(?:es)?[?.!\s]*$|estimated total|落地价/i;
+const listedPriceTopic = /\bprice\b|\bhow much (?:is|for) (?:it|this|the car)\b|\b(?:what|how much) (?:does|would|will) (?:it|this(?: (?:car|vehicle))?|the (?:car|vehicle)) cost\b(?!\s+(?:to|per))|\bwhat(?:['’]s| is) the (?:asking\b|cost\b(?!\s+(?:of|to|for)))|\b(?:what|how much) are you asking(?:\s+for\s+(?:it|this|the car))?\s*(?:[?.!,]|$)|^\s*(?:asking|cost)\s*[?.!]*\s*$/i;
+const visitTopic = /test[- ]?drive|come in|visit|appointment|试驾/i;
+const slotPattern = /\b(?:(?:next |this )?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)|today|tomorrow)(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?(?:\s*[ap]\.?m\.?)?)?\b|\b(?:at\s+\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|\d{1,2}(?::\d{2})?\s*[ap]m)\b/i;
+
+function cashPreference(text) {
+  if (/\b(?:no|not|without|instead of|rather than|can't|cannot|won't|don['’]t)\s+(?:(?:be|pay|paying|use|using|have|in|with|any)\s+)*cash\b|不(?:付|用)?现金/i.test(text)) return false;
+  if (/\bcash\s+(?:is(?:n['’]t| not)|won['’]t|is off)|\b(?:pay(?:ing)? by card|financ(?:e|ing))\s+(?:instead|rather)|不是现金|不用现金/i.test(text)) return false;
+  if (/\bcash\b|现金/i.test(text)) return true;
+  if (/\b(?:financing|finance it|pay by card)\b/i.test(text)) return false;
+  return undefined;
+}
+
+function quoteZip(text) {
+  return text.match(/\b(?:zip(?:\s*code)?\s*(?:is\s+|[:#]\s*)?|(?:for|in|to|otd))\s*(\d{5})\b/i)?.[1]
+    ?? text.match(/^\s*(\d{5})(?:[?!.,\s]|$)/)?.[1];
+}
+
+function otdReply(facts, cash, zip) {
+  if (zip !== DEALERSHIP.otdZip) return {
+    text: `Our sales team will need to verify taxes and fees for ZIP ${zip} before quoting an out-the-door total.`,
+    notes: [`No approved estimate for ZIP ${zip}.`],
+  };
   const notes = ['Test-only estimate; this is not a binding quote. Sales must confirm final rates and fees.'];
   const price = facts.price_usd === null || facts.price_usd === undefined || facts.price_usd === '' ? null : Number(facts.price_usd);
   if (!Number.isFinite(price)) {
     return { text: 'I’ll have our sales team prepare an itemized out-the-door estimate for ZIP 91731; final rates and fees must be confirmed.', notes };
   }
-  const cash = /\bcash\b/i.test(question);
-  const estimate = estimateOutTheDoor({ price, cashDiscount: cash ? DEALERSHIP.cashDiscount : 0 });
+  const estimate = estimateOutTheDoor({ price, cashDiscount: cash ? DEALERSHIP.cashDiscount : 0, zip });
   const lines = [
     `For ZIP ${estimate.zip}, this is a test estimate:`,
     `Vehicle price: ${money(estimate.vehicle_price)}`,
@@ -215,8 +242,8 @@ function otdReply(facts, question) {
   return { text: lines.join('\n'), notes, estimate };
 }
 
-export function policyReply({ vehicleFacts = {}, question = '', testMode = process.env.DEALER_AI_TEST_MODE === '1' } = {}) {
-  const q = String(question || '').toLowerCase();
+export function policyReply({ vehicleFacts = {}, question = '', history = [], testMode = process.env.DEALER_AI_TEST_MODE === '1' } = {}) {
+  const q = String(question || '').trim().toLowerCase();
   if (!q.trim()) return null;
   const facts = vehicleFacts || {};
   const draft = [];
@@ -225,61 +252,82 @@ export function policyReply({ vehicleFacts = {}, question = '', testMode = proce
   const adds = value => { if (value && !draft.includes(value)) draft.push(value); };
   const addNotes = values => { for (const note of values || []) if (note && !notes.includes(note)) notes.push(note); };
 
-  const asksOtd = /(out[- ]?the[- ]?door|\botd\b|total (price|cost)|zip(?: code)?\s*91731|\b91731\b|tax(es)? and fees|estimated total)/i.test(q);
+  const recent = history.slice(-8).toReversed();
+  const buyers = recent.filter(turn => turn.direction === 'inbound').map(turn => turn.body);
+  const followUp = /^(?:what about|how about|and\b|what if|instead\b|那)|^(?:if I (?:pay|use) cash|cash|现金)[?.!\s]*$/i.test(q) || /^\s*\d{5}\s*[?.!]?\s*$/.test(q);
+  const previousTopic = recent.find(turn => otdTopic.test(turn.body) || listedPriceTopic.test(turn.body) || visitTopic.test(turn.body));
+  const explicitCash = cashPreference(q);
+  const cash = explicitCash ?? (followUp && buyers.map(cashPreference).find(value => value !== undefined)) ?? false;
+  const zip = quoteZip(q) ?? ((followUp || otdTopic.test(q)) ? buyers.map(quoteZip).find(Boolean) : undefined) ?? DEALERSHIP.otdZip;
+  const asksOtd = otdTopic.test(q) || /\b91731\b/.test(q) || (followUp && otdTopic.test(previousTopic?.body || ''));
   if (asksOtd) {
     intents.push('out_the_door');
-    const result = otdReply(facts, q);
+    const result = otdReply(facts, cash, zip);
     adds(result.text); addNotes(result.notes);
-  } else {
-    const asksRegistration = /registration/i.test(q) && /(own|myself|handle|self)/i.test(q);
-    const asksFinancing = /(financ|loan|credit|down payment|apr|monthly payment)/i.test(q);
-    const asksTrade = /trade[- ]?in/i.test(q);
-    const asksHybrid = /hybrid battery/i.test(q);
-    const asksSmog = /smog/i.test(q);
-    const asksAc = /(a\/c|air condition|air conditioning)/i.test(q);
-    const asksWarranty = /warranty/i.test(q);
-    const asksLocation = /(where|located|location|address)/i.test(q);
-    const asksTestDrive = /(test[- ]?drive|come in|visit|appointment)/i.test(q);
-    const asksBestPrice = /(best price|negotiable|discount|deal)/i.test(q);
+  }
+  const asksRegistration = /registration/i.test(q) && /(own|myself|handle|self)/i.test(q);
+  const asksFinancing = /(financ|loan|credit|down payment|apr|monthly payment)/i.test(q);
+  const asksTrade = /trade[- ]?in/i.test(q);
+  const asksHybrid = /hybrid battery/i.test(q);
+  const asksSmog = /smog/i.test(q);
+  const asksAc = /(a\/c|air condition|air conditioning)/i.test(q);
+  const asksWarranty = /warranty/i.test(q);
+  const asksLocation = /(where|located|location|address)/i.test(q);
+  const time = question.match(slotPattern)?.[0];
+  const asksTestDrive = visitTopic.test(q) || (time && visitTopic.test(previousTopic?.body || ''));
+  const proposedTime = time || (followUp && asksTestDrive ? buyers.map(text => text.match(slotPattern)?.[0]).find(Boolean) : null);
+  const asksBestPrice = /\b(?:best price|negotiable|discounts?|deal)\b/i.test(q) || (cash && followUp && !asksOtd);
+  if (!asksOtd && !asksBestPrice && listedPriceTopic.test(q)) {
+    intents.push('listed_price');
+    adds(Number.isFinite(facts.price_usd) ? `The listed price is ${money(facts.price_usd)} before taxes and fees.` : 'Our team will confirm the listed price.');
+  }
 
-    if (asksRegistration) {
-      intents.push('registration');
-      adds('Our dealership normally handles title and registration. I can ask my manager whether there’s any flexibility for your purchase.');
+  if (asksRegistration) {
+    intents.push('registration');
+    adds('Our dealership normally handles title and registration. I can ask my manager whether there’s any flexibility for your purchase.');
+  }
+  if (asksFinancing) {
+    intents.push('financing');
+    const result = financingReply(facts, q);
+    adds(result.text); addNotes(result.notes);
+  }
+  if (asksTrade) {
+    intents.push('trade_in');
+    adds(tradeInReply(q));
+  }
+  if (asksHybrid) {
+    intents.push('hybrid_battery');
+    const result = hybridBatteryReply(facts, q);
+    adds(result.text); addNotes(result.notes);
+  }
+  if (asksSmog || asksAc) {
+    intents.push('smog_ac');
+    const result = smogAcReply(facts, asksSmog, asksAc);
+    adds(result.text); addNotes(result.notes);
+  }
+  if (asksWarranty) {
+    intents.push('warranty');
+    adds(DEALERSHIP.warranty);
+    addNotes(['Sales manager must confirm warranty availability and coverage before it is promised.']);
+  }
+  if (asksTestDrive && facts.availability === 'sold') {
+    intents.push('availability');
+    adds(availabilityReply(facts));
+    addNotes(['This vehicle is sold. Do not offer a test drive for it.']);
+    if (asksLocation) adds(locationTestDriveReply(true, false));
+  } else if (asksLocation || asksTestDrive) {
+    intents.push('location_test_drive');
+    adds(locationTestDriveReply(asksLocation, asksTestDrive, proposedTime));
+    addNotes(['Sales must confirm the appointment time; do not mark a test drive as booked.']);
+  }
+  if (asksBestPrice && !asksOtd) {
+    intents.push('best_price');
+    adds(bestPriceReply(cash));
+    if (cash && Number.isFinite(facts.price_usd)) {
+      const quote = estimateOutTheDoor({ price: facts.price_usd, cashDiscount: DEALERSHIP.cashDiscount });
+      adds(`The discounted vehicle price is ${money(quote.discounted_price)} before taxes and fees.`);
     }
-    if (asksFinancing) {
-      intents.push('financing');
-      const result = financingReply(facts, q);
-      adds(result.text); addNotes(result.notes);
-    }
-    if (asksTrade) {
-      intents.push('trade_in');
-      adds(tradeInReply(q));
-    }
-    if (asksHybrid) {
-      intents.push('hybrid_battery');
-      const result = hybridBatteryReply(facts, q);
-      adds(result.text); addNotes(result.notes);
-    }
-    if (asksSmog || asksAc) {
-      intents.push('smog_ac');
-      const result = smogAcReply(facts, asksSmog, asksAc);
-      adds(result.text); addNotes(result.notes);
-    }
-    if (asksWarranty) {
-      intents.push('warranty');
-      adds(DEALERSHIP.warranty);
-      addNotes(['Sales manager must confirm warranty availability and coverage before it is promised.']);
-    }
-    if (asksLocation || asksTestDrive) {
-      intents.push('location_test_drive');
-      adds(locationTestDriveReply(asksLocation, asksTestDrive));
-      addNotes(['Sales must confirm the appointment time; do not mark a test drive as booked.']);
-    }
-    if (asksBestPrice) {
-      intents.push('best_price');
-      adds(bestPriceReply(q));
-      addNotes(['Only the approved $200 cash offer may be offered in a draft; anything beyond goes to sales.']);
-    }
+    addNotes(['Only the approved $200 cash offer may be offered in a draft; anything beyond goes to sales.']);
   }
 
   const asksAvailability = /(still available|available|in stock|still have|still there)/i.test(q);

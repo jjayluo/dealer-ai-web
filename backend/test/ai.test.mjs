@@ -203,3 +203,159 @@ test('vehicle facts include the CARFAX history and gate test-only mileage by env
     else process.env.DEALER_AI_TEST_MODE = previous;
   }
 });
+
+test('mileage attribution follows the recorded source and conflicts require verification', () => {
+  for (const source of ['Dealer', 'Other', 'Unknown', null]) {
+    const facts = baseFacts({ mileage_source: source });
+    const reply = policyReply({ vehicleFacts: facts, question: 'How many miles?' });
+    assert.match(reply.draft, /163,099 miles/);
+    assert.doesNotMatch(reply.draft, /CARFAX/i);
+  }
+  const reply = policyReply({ vehicleFacts: baseFacts({ mileage_conflict: true, test_current_mileage: 169999 }), question: 'How many miles?', testMode: true });
+  assert.doesNotMatch(reply.draft, /169,999|163,099/);
+  assert.match(reply.draft, /verification/);
+});
+
+test('follow-ups use the buyer’s terms and separate every requested topic', () => {
+  const ask = (question, history = [], facts = {}) => policyReply({ vehicleFacts: baseFacts(facts), question, history });
+  const history = [{ direction: 'inbound', body: 'Can I get an out-the-door quote for ZIP 10001?' },
+    { direction: 'outbound', body: 'I will check the fees.' }];
+  assert.match(ask('What about cash?', history).draft, /verify taxes and fees for ZIP 10001/);
+  assert.doesNotMatch(ask('What about cash?', history).draft, /\$/);
+  const prior = [{ direction: 'inbound', body: 'What is the out-the-door total for 91731 if I pay cash?' }];
+  assert.match(ask('What about cash?', prior).draft, /\$11,030/);
+  const noCash = ask("What if I'm not paying cash? And is there a warranty?", prior);
+  assert.match(noCash.draft, /\$11,250/);
+  assert.match(noCash.draft, /optional three-month/);
+  assert.doesNotMatch(noCash.draft, /cash discount/i);
+  assert.doesNotMatch(ask('Where is your dealership?').draft, /discount|best price/i);
+  assert.match(ask('Can I test drive it Saturday at 2?').draft, /check Saturday at 2/);
+  const visit = [{ direction: 'outbound', body: 'When would you like a test drive?' }];
+  assert.match(ask('Tomorrow at 3 pm', visit).draft, /check Tomorrow at 3 pm/);
+  assert.doesNotMatch(ask('Can I test drive it Saturday?', [], { availability: 'sold' }).draft, /confirm the appointment/);
+  assert.doesNotMatch(ask('Does the A/C work?', [], { ac_status: 'works', inspection_conflict: true }).draft, /blows cold/i);
+  assert.doesNotMatch(ask('Can I finance it?').draft, /2,000/);
+  assert.equal(estimateOutTheDoor({ price: 10000, zip: '10001' }), null);
+});
+
+test('provider drafts preserve verified terms and reject unsupported claims before display', async t => {
+  const config = { AI_PROVIDER: 'openai', AI_API_STYLE: 'responses', AI_API_KEY: 'test-fixture', AI_MODEL: 'fixture' };
+  for (const [key, value] of Object.entries(config)) {
+    const previous = process.env[key];
+    process.env[key] = value;
+    t.after(() => { if (previous === undefined) delete process.env[key]; else process.env[key] = previous; });
+  }
+  let draft = '[[verified_reply]]\nWhat else would you like to know?';
+  let received;
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    received = JSON.parse(JSON.parse(init.body).input);
+    return Response.json({ status: 'completed', output_text: JSON.stringify({ draft, verificationNotes: [] }) });
+  });
+  const facts = baseFacts({ price_usd: 7720, availability: 'reserved' });
+  for (const prose of ['It’s listed at 163,099 miles.', 'The odometer is listed at 262,480 km.',
+    'It is currently reserved.', 'The records show scheduled maintenance.', 'Maintenance is scheduled for Saturday.', 'The appointment is not yet confirmed.']) {
+    draft = prose;
+    const response = await generateReply({ vehicleFacts: facts, question: 'How many miles?' });
+    assert.equal(response.draft, prose);
+    assert.equal(response.provider, 'openai');
+  }
+  for (const prose of ['It is listed at 7,720.', 'It is listed at 163,099 miles and priced at $7,720.',
+    'It’s reserved for you.', 'We scheduled your appointment.', 'Your test drive is booked.']) {
+    draft = prose;
+    assert.match((await generateReply({ vehicleFacts: facts, question: 'How many miles?' })).warning, /withheld/);
+  }
+  for (const [question, expected] of [
+    ['What does it cost?', /listed price is \$7,720/], ['How much does it cost?', /listed price is \$7,720/],
+    ['What are you asking?', /listed price is \$7,720/], ['What would I pay after tax?', /Estimated out-the-door total: \$8,742/],
+    ['How much is the sales tax?', /Estimated tax/], ['What would I pay after tax for ZIP 10001?', /verify taxes and fees for ZIP 10001/],
+  ]) {
+    draft = '[[verified_reply]]';
+    const response = await generateReply({ vehicleFacts: facts, question });
+    assert.match(received.verifiedReply, expected);
+    assert.equal(response.provider, 'openai');
+    assert.equal(response.draft, received.verifiedReply);
+  }
+  assert.equal(policyReply({ question: 'How much does it cost to replace the tires?', vehicleFacts: facts }), null);
+  draft = '[[verified_reply]]\nWhat else would you like to know?';
+  const history = [{ direction: 'inbound', body: 'What is the OTD price for ZIP 91731?' }];
+  const input = { question: 'What about cash?', vehicleFacts: baseFacts(), history };
+  const result = await generateReply(input);
+  assert.deepEqual(received.recentMessages, history);
+  assert.equal(received.buyerMessage, input.question);
+  assert.match(result.draft, /11,030/);
+  assert.match(result.draft, /What else/);
+  assert.doesNotMatch(result.draft, /\[\[/);
+  assert.equal(result.provider, 'openai');
+  for (const [bad, reason] of [
+    ['[[verified_reply]] The listed price is $12,000.', /financial terms/],
+    ['[[verified_reply]] Your Saturday appointment is confirmed.', /booking/],
+    ['I can help with that.', /did not preserve/],
+  ]) {
+    draft = bad;
+    const blocked = await generateReply(input);
+    assert.match(blocked.warning, reason);
+    assert.equal(blocked.provider, 'policy');
+    assert.doesNotMatch(blocked.draft, /12,000|appointment is confirmed|I can help with that/);
+  }
+  draft = '[[verified_reply]]\nThe A/C blows cold.';
+  const conflict = await generateReply({ question: 'Does the A/C work?', vehicleFacts: baseFacts({ inspection_conflict: true }) });
+  assert.match(conflict.warning, /inspection records conflict/);
+  assert.doesNotMatch(conflict.draft, /blows cold/i);
+  draft = 'Your appointment is booked.';
+  const unrelated = await generateReply({ vehicleFacts: baseFacts(), question: 'Any photos?' });
+  assert.match(unrelated.warning, /booking/);
+  assert.doesNotMatch(unrelated.draft, /booked/);
+});
+
+test('provider finish reasons distinguish truncation, malformed JSON and other stops', async t => {
+  const config = { AI_PROVIDER: 'openai', AI_API_KEY: 'fixture', AI_MODEL: 'fixture', AI_API_STYLE: 'chat' };
+  for (const [key, value] of Object.entries(config)) {
+    const old = process.env[key];
+    process.env[key] = value;
+    t.after(() => { if (old === undefined) delete process.env[key]; else process.env[key] = old; });
+  }
+  const requests = [];
+  const diagnostics = [];
+  let replies = [];
+  t.mock.method(console, 'warn', (_label, metadata) => diagnostics.push(metadata));
+  t.mock.method(globalThis, 'fetch', async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return Response.json(replies.shift());
+  });
+  const input = { question: 'How many miles?', vehicleFacts: baseFacts() };
+  const valid = JSON.stringify({ draft: 'It is listed at 163,099 miles.', verificationNotes: [] });
+  const bad = '{"draft":"partial","verificationNotes":["one" "two"]}';
+  const styles = [
+    ['chat', 'length', 'stop', (reason, raw) => ({ choices: [{ finish_reason: reason, message: { content: raw } }] })],
+    ['anthropic', 'max_tokens', 'end_turn', (reason, raw) => ({ stop_reason: reason, content: [{ type: 'text', text: raw }] })],
+    ['responses', 'max_output_tokens', 'completed', (reason, raw) => reason === 'completed'
+      ? { status: reason, output_text: raw } : { status: 'incomplete', incomplete_details: { reason }, output_text: raw }],
+  ];
+  for (const [style, limit, done, wrap] of styles) {
+    process.env.AI_API_STYLE = style;
+    requests.length = 0;
+    replies = [wrap(limit, valid), wrap(done, valid)];
+    const recovered = await generateReply(input);
+    assert.equal(recovered.draft, 'It is listed at 163,099 miles.');
+    assert.equal(requests.length, 2);
+    const budget = style === 'responses' ? 'max_output_tokens' : 'max_tokens';
+    assert.ok(requests[1][budget] > requests[0][budget]);
+    assert.deepEqual(diagnostics.at(-1), { apiStyle: style, attempt: 1, kind: 'truncated', stopReason: limit });
+    requests.length = 0;
+    replies = [wrap(done, bad), wrap(done, bad)];
+    const failed = await generateReply(input);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1][budget], requests[0][budget]);
+    assert.match(JSON.stringify(requests[1]), /separate array entries/);
+    assert.equal(failed.provider, 'policy');
+    assert.match(failed.warning, /invalid draft JSON/);
+    assert.deepEqual(diagnostics.at(-1), { apiStyle: style, attempt: 2, kind: 'format', stopReason: done });
+    replies = [wrap(limit, bad), wrap(limit, bad)];
+    assert.match((await generateReply(input)).warning, /token limit/);
+  }
+  process.env.AI_API_STYLE = 'chat';
+  requests.length = 0;
+  replies = [{ choices: [{ finish_reason: 'content_filter', message: { content: '' } }] }];
+  assert.match((await generateReply(input)).warning, /stopped/);
+  assert.equal(requests.length, 1);
+});

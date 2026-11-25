@@ -9,14 +9,23 @@
   <script src="/app/app.js" defer></script>
 </head>
 <body>
-  <section id="login" class="login-card">
-    <h1>DealerAI</h1><p>Sign in to manage inventory, customers, leads and staff access.</p>
+  <main id="catalog" class="public-catalog" hidden>
+    <header class="catalog-header"><span class="login-brand"><span class="brand-mark" aria-hidden="true">D</span>DealerAI</span><a href="#login">Staff sign in</a></header>
+    <div class="catalog-content"><h1>Available vehicles</h1>
+      <p class="muted">Choose a vehicle to view its details and ask our team a question.</p>
+      <div id="catalog-results" aria-live="polite"></div>
+      <nav id="catalog-pages" class="catalog-pages" aria-label="Inventory pages" hidden></nav>
+    </div>
+  </main>
+  <section id="login" class="login-card" hidden>
+    <p class="login-brand"><span class="brand-mark" aria-hidden="true">D</span>DealerAI</p>
+    <h1>Staff sign in</h1>
     <form id="login-form">
       <label>Email<input name="email" type="email" autocomplete="username" required></label>
       <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
       <button class="blue-btn" type="submit">Sign in</button>
     </form>
-    <p class="muted">Use your staff account. Ask an administrator if you need access.</p>
+    <p class="muted"><a href="#browse">Browse available vehicles</a></p>
   </section>
   <section id="accept" class="login-card" hidden>
     <h1>Accept invitation</h1><p>Set your name and a password of at least 10 characters to activate your account.</p>
@@ -27,9 +36,30 @@
       <button class="blue-btn" type="submit">Activate account</button>
     </form>
   </section>
+  <section id="inquiry" class="inquiry-card" hidden>
+    <p class="inquiry-brand"><a href="#browse">← Available vehicles</a></p>
+    <h1>Ask about this vehicle</h1>
+    <p class="muted">Send a question to our team. No account is needed.</p>
+    <div id="inquiry-vehicle" class="inquiry-vehicle"><p class="muted">Loading vehicle…</p></div>
+    <form id="inquiry-form">
+      <input type="hidden" name="vehicle_id">
+      <input type="hidden" name="submission_id">
+      <div class="editor-grid inquiry-grid">
+        <label>Full name<input name="name" type="text" maxlength="160" autocomplete="name" required></label>
+        <label>Email<input name="email" type="email" maxlength="254" autocomplete="email"></label>
+        <label>Phone<input name="phone" type="tel" maxlength="30" autocomplete="tel"></label>
+        <label>Preferred contact<select name="preferred_contact"><option value="email">Email</option><option value="phone">Phone</option></select></label>
+        <label class="wide">Your question<textarea name="question" maxlength="4000" required placeholder="What would you like to know about this vehicle?"></textarea></label>
+        <label class="wide inquiry-consent"><input type="checkbox" name="consent" required> I agree to be contacted about this inquiry.</label>
+      </div>
+      <p class="form-error" role="alert"></p>
+      <div class="dialog-actions"><button class="blue-btn" type="submit">Send inquiry</button></div>
+    </form>
+    <div id="inquiry-success" class="inquiry-success" hidden></div>
+  </section>
   <div id="workspace" class="app" hidden>
     <aside class="sidebar">
-      <p class="brand">DealerAI</p>
+      <p class="brand"><span class="brand-mark" aria-hidden="true">D</span>DealerAI</p>
       <nav aria-label="Main navigation">
         <a class="nav-link" href="#vehicles">Inventory</a>
         <a class="nav-link" href="#customers">Customers</a>
@@ -40,10 +70,15 @@
       <p id="user-label"></p><button id="logout" class="secondary-btn">Sign out</button>
     </aside>
     <main class="main">
-      <header class="topbar"><h1 id="page-title">Inventory</h1></header>
+      <header class="topbar">
+        <div><h1 id="page-title">Inventory</h1><p id="description" class="muted"></p></div>
+      </header>
       <section id="standard-view" class="content">
+        <div class="page-actions">
+          <input class="search-top" id="list-search" name="q" type="search" form="filters" aria-label="Search records" placeholder="Search inventory">
+          <button id="add" class="blue-btn">Add vehicle</button>
+        </div>
         <div id="stats" class="stats" aria-label="Module totals"></div>
-        <div class="page-actions"><p id="description" class="muted"></p><button id="add" class="blue-btn">Add vehicle</button></div>
         <form id="filters" class="filter-card"></form>
         <div id="results" class="table-card" aria-live="polite"></div>
         <div class="pagination"><button id="previous" class="secondary-btn">Previous</button><span id="page-info"></span><button id="next" class="secondary-btn">Next</button></div>
@@ -53,9 +88,17 @@
           <div class="conversation-list-head">
             <div class="conversation-list-title-row">
               <h1>Inbox</h1>
-              <button class="blue-btn compact" id="new-conversation" type="button">+ New</button>
+              <button class="blue-btn compact" id="new-conversation" type="button">New conversation</button>
             </div>
-            <input class="conversation-search" id="conversation-search" placeholder="Search conversations">
+            <input class="conversation-search" id="conversation-search" aria-label="Search conversations" placeholder="Search conversations">
+            <div class="inbox-filters">
+              <select id="channel-filter" aria-label="Filter by channel">
+                <option value="">All channels</option>
+                <option value="web">Web</option><option value="email">Email</option><option value="phone">Phone</option>
+                <option value="sms">SMS</option><option value="facebook">Facebook</option><option value="whatsapp">WhatsApp</option>
+              </select>
+              <select id="assignee-filter" aria-label="Filter by assignee"><option value="">All assignees</option></select>
+            </div>
             <div class="conversation-tabs" id="conversation-tabs">
               <button class="conversation-tab active" type="button" data-filter="all">All <span id="conv-count-all">0</span></button>
               <button class="conversation-tab" type="button" data-filter="open">Open <span id="conv-count-open">0</span></button>
@@ -81,13 +124,12 @@
           </div>
           <div id="ai-suggestion-panel" class="suggest ai-panel" hidden></div>
           <div class="conversation-composer" id="conversation-composer" hidden>
-            <textarea id="message-input" placeholder="Type your reply..."></textarea>
+            <textarea id="message-input" aria-label="Reply text" placeholder="Write a reply…"></textarea>
             <div class="composer-status" id="composer-status"></div>
             <div class="composer-bottom">
-              <button class="attach-button" type="button" id="log-customer-message">+ Log customer question</button>
               <div class="composer-actions">
                 <button class="secondary-btn" type="button" id="ai-reply-btn">✦ AI suggested reply</button>
-                <button class="blue-btn" type="button" id="send-reply-btn">Send reply</button>
+                <button class="blue-btn" type="button" id="send-reply-btn">Record reply</button>
               </div>
             </div>
           </div>
